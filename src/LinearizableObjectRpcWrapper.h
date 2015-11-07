@@ -13,7 +13,6 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
-#include "Common.h"
 #include "RamCloud.h"
 #include "ObjectRpcWrapper.h"
 #include "RpcTracker.h"
@@ -44,6 +43,7 @@ class LinearizableObjectRpcWrapper
             Buffer* response = NULL);
     virtual ~LinearizableObjectRpcWrapper();
     void cancel();
+    virtual bool isReady();
 
     /**
      * This flag allows users of linearizable RPCs to specific whether to send
@@ -56,6 +56,9 @@ class LinearizableObjectRpcWrapper
     void fillLinearizabilityHeader(RpcRequest* reqHdr);
 
     bool waitInternal(Dispatch* dispatch, uint64_t abortTime = ~0UL);
+
+    // General client information.
+    RamCloud* ramcloud;
 
     /**
      * If the linearizability feature is on, we save the rpcId assigned in

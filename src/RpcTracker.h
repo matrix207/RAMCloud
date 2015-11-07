@@ -16,8 +16,6 @@
 #ifndef RAMCLOUD_RPCTRACKER_H
 #define RAMCLOUD_RPCTRACKER_H
 
-#include "Common.h"
-
 namespace RAMCloud {
 
 class RamCloud;
@@ -65,7 +63,7 @@ class RpcTracker {
     RpcTracker()
         : firstMissing(1)
         , nextRpcId(1)
-        , rpcs({})
+        , rpcs()
     {}
     ~RpcTracker();
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 
-# Copyright (c) 2011-2014 Stanford University
+# Copyright (c) 2011-2015 Stanford University
 #
 # Permission to use, copy, modify, and distribute this software for any
 # purpose with or without fee is hereby granted, provided that the above
@@ -211,10 +211,14 @@ def run_test(
         client_args['--workload'] = options.workload
     if options.targetOps != None:
         client_args['--targetOps'] = options.targetOps
+    if options.txSpan != None:
+        client_args['--txSpan'] = options.txSpan
     if options.numIndexlet != None:
         client_args['--numIndexlet'] = options.numIndexlet
     if options.numIndexes != None:
         client_args['--numIndexes'] = options.numIndexes
+    if options.numVClients != None:
+        client_args['--numVClients'] = options.numVClients
     test.function(test.name, options, cluster_args, client_args)
 
 #-------------------------------------------------------------------
@@ -262,19 +266,19 @@ def broadcast(name, options, cluster_args, client_args):
 
 def indexBasic(name, options, cluster_args, client_args):
     if 'master_args' not in cluster_args:
-        cluster_args['master_args'] = '--masterServiceThreads 1 --totalMasterMemory 1500'
+        cluster_args['master_args'] = '--maxCores 2 --totalMasterMemory 1500'
     if cluster_args['timeout'] < 200:
         cluster_args['timeout'] = 200
     # Ensure at least 5 hosts for optimal performance
     if options.num_servers == None:
-        cluster_args['num_servers'] = len(hosts)
+        cluster_args['num_servers'] = len(getHosts())
     cluster.run(client='%s/ClusterPerf %s %s' %
             (obj_path, flatten_args(client_args), name), **cluster_args)
     print(get_client_log(), end='')
 
 def indexRange(name, options, cluster_args, client_args):
     if 'master_args' not in cluster_args:
-        cluster_args['master_args'] = '--masterServiceThreads 1 --totalMasterMemory 1500'
+        cluster_args['master_args'] = '--maxCores 2 --totalMasterMemory 1500'
     if cluster_args['timeout'] < 360:
         cluster_args['timeout'] = 360
 
@@ -287,31 +291,31 @@ def indexRange(name, options, cluster_args, client_args):
 
     # Ensure at least 5 hosts for optimal performance
     if options.num_servers == None:
-        cluster_args['num_servers'] = len(hosts)
+        cluster_args['num_servers'] = len(getHosts())
     cluster.run(client='%s/ClusterPerf %s %s' %
             (obj_path, flatten_args(client_args), name), **cluster_args)
     print(get_client_log(), end='')
 
 def indexMultiple(name, options, cluster_args, client_args):
     if 'master_args' not in cluster_args:
-        cluster_args['master_args'] = '--masterServiceThreads 1'
+        cluster_args['master_args'] = '--maxCores 2'
     if cluster_args['timeout'] < 360:
         cluster_args['timeout'] = 360
     # Ensure atleast 15 hosts for optimal performance
     if options.num_servers == None:
-        cluster_args['num_servers'] = len(hosts)
+        cluster_args['num_servers'] = len(getHosts())
 
     # use a maximum of 10 secondary keys
-    if len(hosts) <= 10:
+    if len(getHosts()) <= 10:
         # Hack until synchronization bug in write RPC handler
         # in MasterService is resolved. This bug prevents us from using more
         # than 1 MasterSerivice thread. However, we need to use more than 1
         # service thread, otherwise if a tablet and its corresponding
         # indexlet end up on the same server, we will have a deadlock.
         # For now, make sure that we never wrap around the server list
-        # Once the bug is resolved, we should be able to use len(hosts)
+        # Once the bug is resolved, we should be able to use len(getHosts())
         # for numIndexes
-        client_args['--numIndexes'] = len(hosts) - 1
+        client_args['--numIndexes'] = len(getHosts()) - 1
     else:
         client_args['--numIndexes'] = 10
 
@@ -321,7 +325,7 @@ def indexMultiple(name, options, cluster_args, client_args):
 
 def indexScalability(name, options, cluster_args, client_args):
     if 'master_args' not in cluster_args:
-        cluster_args['master_args'] = '--masterServiceThreads 2'
+        cluster_args['master_args'] = '--maxCores 3'
     if cluster_args['timeout'] < 360:
         cluster_args['timeout'] = 360
     cluster_args['backups_per_server'] = 0
@@ -335,7 +339,7 @@ def indexScalability(name, options, cluster_args, client_args):
 
     # Ensure at least 15 hosts for optimal performance
     if options.num_servers == None:
-        cluster_args['num_servers'] = len(hosts)
+        cluster_args['num_servers'] = len(getHosts())
     if 'num_clients' not in cluster_args:
         cluster_args['num_clients'] = 10
     cluster.run(client='%s/ClusterPerf %s %s' %
@@ -344,12 +348,12 @@ def indexScalability(name, options, cluster_args, client_args):
 
 def indexWriteDist(name, options, cluster_args, client_args):
     if 'master_args' not in cluster_args:
-        cluster_args['master_args'] = '--masterServiceThreads 1 --totalMasterMemory 1500'
+        cluster_args['master_args'] = '--maxCores 2 --totalMasterMemory 1500'
     if cluster_args['timeout'] < 200:
         cluster_args['timeout'] = 200
 
     if options.num_servers == None:
-        cluster_args['num_servers'] = len(hosts)
+        cluster_args['num_servers'] = len(getHosts())
 
     if '--count' not in client_args:
         client_args['--count'] = 10000
@@ -375,12 +379,12 @@ def indexWriteDist(name, options, cluster_args, client_args):
 
 def indexReadDist(name, options, cluster_args, client_args):
     if 'master_args' not in cluster_args:
-        cluster_args['master_args'] = '--masterServiceThreads 1 --totalMasterMemory 1500'
+        cluster_args['master_args'] = '--maxCores 2 --totalMasterMemory 1500'
     if cluster_args['timeout'] < 200:
         cluster_args['timeout'] = 200
 
     if options.num_servers == None:
-        cluster_args['num_servers'] = len(hosts)
+        cluster_args['num_servers'] = len(getHosts())
 
     if '--count' not in client_args:
         client_args['--count'] = 10000
@@ -409,7 +413,6 @@ def indexReadDist(name, options, cluster_args, client_args):
 def transactionDist(name, options, cluster_args, client_args):
     if 'master_args' not in cluster_args:
         cluster_args['master_args'] = '-t 2000'
-    cluster_args['disjunct'] = True
     if options.numTables == None:
         client_args['--numTables'] = 1
     cluster.run(client='%s/ClusterPerf %s %s' %
@@ -434,12 +437,11 @@ def transactionThroughput(name, options, cluster_args, client_args):
     if cluster_args['timeout'] < 250:
         cluster_args['timeout'] = 250
     if 'num_clients' not in cluster_args:
-        cluster_args['num_clients'] = len(hosts) - cluster_args['num_servers']
+        cluster_args['num_clients'] = len(getHosts()) - cluster_args['num_servers']
     if cluster_args['num_clients'] < 2:
         print("Not enough machines in the cluster to run the '%s' benchmark"
                 % name)
-        print("Need at least %d machines in this configuration" %
-                (cluster_args['num_servers'] + 2))
+        print("Need at least 2 machines in this configuration")
         return
     if options.numTables == None:
         client_args['--numTables'] = 1
@@ -452,7 +454,7 @@ def multiOp(name, options, cluster_args, client_args):
     if cluster_args['timeout'] < 100:
         cluster_args['timeout'] = 100
     if options.num_servers == None:
-        cluster_args['num_servers'] = len(hosts)
+        cluster_args['num_servers'] = len(getHosts())
     client_args['--numTables'] = cluster_args['num_servers'];
     cluster.run(client='%s/ClusterPerf %s %s' %
             (obj_path, flatten_args(client_args), name),
@@ -461,11 +463,11 @@ def multiOp(name, options, cluster_args, client_args):
 
 def netBandwidth(name, options, cluster_args, client_args):
     if 'num_clients' not in cluster_args:
-        cluster_args['num_clients'] = 2*len(config.hosts)
+        cluster_args['num_clients'] = 2*len(config.getHosts())
     if options.num_servers == None:
         cluster_args['num_servers'] = cluster_args['num_clients']
-        if cluster_args['num_servers'] > len(config.hosts):
-            cluster_args['num_servers'] = len(config.hosts)
+        if cluster_args['num_servers'] > len(config.getHosts()):
+            cluster_args['num_servers'] = len(config.getHosts())
     if options.size != None:
         client_args['--size'] = options.size
     else:
@@ -478,9 +480,9 @@ def readAllToAll(name, options, cluster_args, client_args):
     cluster_args['backups_per_server'] = 0
     cluster_args['replicas'] = 0
     if 'num_clients' not in cluster_args:
-        cluster_args['num_clients'] = len(hosts)
+        cluster_args['num_clients'] = len(getHosts())
     if options.num_servers == None:
-        cluster_args['num_servers'] = len(hosts)
+        cluster_args['num_servers'] = len(getHosts())
     client_args['--numTables'] = cluster_args['num_servers'];
     cluster.run(client='%s/ClusterPerf %s %s' %
             (obj_path, flatten_args(client_args), name), **cluster_args)
@@ -501,6 +503,8 @@ def readDist(name, options, cluster_args, client_args):
     print_cdf_from_log()
 
 def readDistRandom(name, options, cluster_args, client_args):
+    if 'master_args' not in cluster_args:
+        cluster_args['master_args'] = '-t 1000'
     cluster.run(client='%s/ClusterPerf %s %s' %
             (obj_path,  flatten_args(client_args), name),
             **cluster_args)
@@ -544,12 +548,11 @@ def readThroughput(name, options, cluster_args, client_args):
     if cluster_args['timeout'] < 250:
         cluster_args['timeout'] = 250
     if 'num_clients' not in cluster_args:
-        cluster_args['num_clients'] = len(hosts) - cluster_args['num_servers']
+        cluster_args['num_clients'] = len(getHosts()) - cluster_args['num_servers']
     if cluster_args['num_clients'] < 2:
         print("Not enough machines in the cluster to run the '%s' benchmark"
                 % name)
-        print("Need at least %d machines in this configuration" %
-                (cluster_args['num_servers'] + 2))
+        print("Need at least 2 machines in this configuration")
         return
     cluster.run(client='%s/ClusterPerf %s %s' %
             (obj_path, flatten_args(client_args), name), **cluster_args)
@@ -559,7 +562,7 @@ def txCollision(name, options, cluster_args, client_args):
     if cluster_args['timeout'] < 100:
         cluster_args['timeout'] = 100
     if options.num_servers == None:
-        cluster_args['num_servers'] = len(hosts)
+        cluster_args['num_servers'] = len(getHosts())
     #client_args['--numTables'] = cluster_args['num_servers'];
     if 'num_clients' not in cluster_args:
         cluster_args['num_clients'] = 5
@@ -658,8 +661,6 @@ graph_tests = [
     Test("writeDistWorkload", workloadDist),
     Test("writeThroughput", readThroughput),
     Test("workloadThroughput", readThroughput),
-    Test("linearizableWriteDistRandom", writeDist),
-    Test("linearizableWriteThroughput", readThroughput),
 ]
 
 if __name__ == '__main__':
@@ -679,7 +680,8 @@ if __name__ == '__main__':
             help='Number of times to perform the operation')
     parser.add_option('--disjunct', action='store_true', default=False,
             metavar='True/False',
-            help='Disjunct (not collocate) entities on a server')
+            help='Do not colocate clients on a node (servers are never '
+                  'colocated, regardless of this option)')
     parser.add_option('--debug', action='store_true', default=False,
             help='Pause after starting servers but before running '
                  'clients to enable debugging setup')
@@ -726,12 +728,18 @@ if __name__ == '__main__':
             choices=['YCSB-A', 'YCSB-B', 'YCSB-C', 'WRITE-ONLY'],
             help='Name of workload to run on extra clients to generate load')
     parser.add_option('--targetOps', type=int,
-            help='Operations per second that each load generating client'
+            help='Operations per second that each load generating client '
             'will try to achieve')
+    parser.add_option('--txSpan', type=int,
+                    help='Number servers a transaction should span.')
     parser.add_option('-i', '--numIndexlet', type=int,
             help='Number of indexlets for measuring index scalability ')
     parser.add_option('-k', '--numIndexes', type=int,
             help='Number of secondary keys/object to measure index operations')
+    parser.add_option('--numVClients', type=int,
+            metavar='N', dest='numVClients',
+            help='Number of virtual clients each client instance should '
+                 'simulate')
     parser.add_option('--rcdf', action='store_true', default=False,
             dest='rcdf',
             help='Output reverse CDF data instead.')

@@ -99,7 +99,7 @@ class TableManager {
     void splitTablet(const char* name, uint64_t splitKeyHash);
     void splitRecoveringTablet(uint64_t tableId, uint64_t splitKeyHash);
     void tabletRecovered(uint64_t tableId, uint64_t startKeyHash,
-            uint64_t endKeyHash, ServerId serverId, Log::Position ctime);
+            uint64_t endKeyHash, ServerId serverId, LogPosition ctime);
 
   PRIVATE:
     /**
@@ -263,7 +263,7 @@ class TableManager {
     Table* recreateTable(const Lock& lock, ProtoBuf::Table* info);
     void serializeTable(const Lock& lock, Table* table,
             ProtoBuf::Table* externalInfo);
-    void sync(const Lock& lock);
+    void syncNextTableId(const Lock& lock);
     void syncTable(const Lock& lock, Table* table,
             ProtoBuf::Table* externalInfo);
     void testAddTablet(const Tablet& tablet);

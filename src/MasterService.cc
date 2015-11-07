@@ -31,12 +31,14 @@
 #include "ProtoBuf.h"
 #include "RawMetrics.h"
 #include "Segment.h"
-#include "ServiceManager.h"
+#include "ServerRpcPool.h"
 #include "ShortMacros.h"
+#include "TableStats.h"
+#include "TimeTrace.h"
 #include "Transport.h"
 #include "Tub.h"
 #include "WallTime.h"
-#include "ServerRpcPool.h"
+#include "WorkerManager.h"
 
 namespace RAMCloud {
 
@@ -66,7 +68,8 @@ MasterService::Replica::Replica(uint64_t backupId, uint64_t segmentId,
  * Construct a MasterService.
  *
  * \param context
- *      Overall information about the RAMCloud server or client.
+ *      Overall information about the RAMCloud server or client. The new
+ *      service will be registered in this context.
  * \param config
  *      Contains various parameters that configure the operation of
  *      this server.
@@ -74,7 +77,6 @@ MasterService::Replica::Replica(uint64_t backupId, uint64_t segmentId,
 MasterService::MasterService(Context* context, const ServerConfig* config)
     : context(context)
     , config(config)
-    , objectFinder(context)
     , objectManager(context,
                     &serverId,
                     config,
@@ -86,20 +88,22 @@ MasterService::MasterService(Context* context, const ServerConfig* config)
     , tabletManager()
     , txRecoveryManager(context)
     , indexletManager(context, &objectManager)
-    , unackedRpcResults(context)
+    , clusterClock()
+    , clientLeaseValidator(context, &clusterClock)
+    , unackedRpcResults(context, &objectManager, &clientLeaseValidator)
     , preparedOps(context)
-    , clusterTime(0)
-    , mutex_updateClusterTime()
     , disableCount(0)
     , initCalled(false)
     , logEverSynced(false)
     , masterTableMetadata()
     , maxResponseRpcLen(Transport::MAX_RPC_LEN)
 {
+    context->services[WireFormat::MASTER_SERVICE] = this;
 }
 
 MasterService::~MasterService()
 {
+    context->services[WireFormat::MASTER_SERVICE] = NULL;
 }
 
 // See Server::dispatch.
@@ -226,6 +230,10 @@ MasterService::dispatch(WireFormat::Opcode opcode, Rpc* rpc)
             callHandler<WireFormat::TxDecision, MasterService,
                         &MasterService::txDecision>(rpc);
             break;
+        case WireFormat::TxRequestAbort::opcode:
+            callHandler<WireFormat::TxRequestAbort, MasterService,
+                        &MasterService::txRequestAbort>(rpc);
+            break;
         case WireFormat::TxHintFailed::opcode:
             callHandler<WireFormat::TxHintFailed, MasterService,
                         &MasterService::txHintFailed>(rpc);
@@ -309,8 +317,12 @@ MasterService::dropTabletOwnership(
         WireFormat::DropTabletOwnership::Response* respHdr,
         Rpc* rpc)
 {
-    tabletManager.deleteTablet(reqHdr->tableId,
-            reqHdr->firstKeyHash, reqHdr->lastKeyHash);
+    bool removed = tabletManager.deleteTablet(reqHdr->tableId,
+                   reqHdr->firstKeyHash, reqHdr->lastKeyHash);
+    if (removed) {
+        TableStats::deleteKeyHashRange(&masterTableMetadata, reqHdr->tableId,
+                reqHdr->firstKeyHash, reqHdr->lastKeyHash);
+    }
 
     // Ensure that the ObjectManager never returns objects from this deleted
     // tablet again.
@@ -419,7 +431,7 @@ MasterService::getHeadOfLog(const WireFormat::GetHeadOfLog::Request* reqHdr,
         WireFormat::GetHeadOfLog::Response* respHdr,
         Rpc* rpc)
 {
-    Log::Position head = objectManager.getLog()->rollHeadOver();
+    LogPosition head = objectManager.getLog()->rollHeadOver();
     respHdr->headSegmentId = head.getSegmentId();
     respHdr->headSegmentOffset = head.getSegmentOffset();
 }
@@ -555,6 +567,15 @@ MasterService::increment(const WireFormat::Increment::Request* reqHdr,
         WireFormat::Increment::Response* respHdr,
         Rpc* rpc)
 {
+    assert(reqHdr->rpcId > 0);
+    UnackedRpcHandle rh(&unackedRpcResults,
+                        reqHdr->lease, reqHdr->rpcId, reqHdr->ackId);
+    if (rh.isDuplicate()) {
+        *respHdr = parseRpcResult<WireFormat::Increment>(rh.resultLoc());
+        rpc->sendReply();
+        return;
+    }
+
     // Read the current value of the object and add the increment value
     Key key(reqHdr->tableId, *rpc->requestPayload, sizeof32(*reqHdr),
             reqHdr->keyLength);
@@ -562,11 +583,14 @@ MasterService::increment(const WireFormat::Increment::Request* reqHdr,
 
     int64_t asInt64 = reqHdr->incrementInt64;
     double asDouble = reqHdr->incrementDouble;
+    uint64_t rpcRecordPtr;
     incrementObject(&key, reqHdr->rejectRules, &asInt64, &asDouble,
-                    &respHdr->version, status);
+                    &respHdr->version, status, reqHdr, respHdr, &rpcRecordPtr);
     if (*status != STATUS_OK)
         return;
     objectManager.syncChanges();
+
+    rh.recordCompletion(rpcRecordPtr);
 
     // Return new value
     respHdr->newValue.asInt64 = asInt64;
@@ -594,6 +618,18 @@ MasterService::increment(const WireFormat::Increment::Request* reqHdr,
  *      The new version of the incremented object on success.
  * \param status
  *      returns STATUS_OK or a failure code if not successful.
+ * \param reqHdr
+ *      Header from the incoming RPC request; contains all the
+ *      parameters for this operation except the key of the object.
+ *      Used for linearizability handling.
+ * \param[out] respHdr
+ *      Header for the response that will be returned to the client.
+ *      The caller has pre-allocated the right amount of space in the
+ *      response buffer for this type of request, and has zeroed out
+ *      its contents (so, for example, status is already zero).
+ *      This must be filled for linearizability handling.
+ * \param[out] rpcResultPtr
+ *      If non-NULL, pointer to the RpcResult in log is returned.
  */
 void
 MasterService::incrementObject(Key *key,
@@ -601,7 +637,10 @@ MasterService::incrementObject(Key *key,
             int64_t *asInt64,
             double *asDouble,
             uint64_t *newVersion,
-            Status *status)
+            Status *status,
+            const WireFormat::Increment::Request* reqHdr,
+            WireFormat::Increment::Response* respHdr,
+            uint64_t *rpcResultPtr)
 {
     // Read the object and add integer or floating point values in case
     // the summands are non-zero.  It is possible to do both an integer
@@ -659,9 +698,11 @@ MasterService::incrementObject(Key *key,
         newValue = oldValue;
         if (*asInt64 != 0) {
             newValue.asInt64 += *asInt64;
+            if (respHdr) respHdr->newValue.asInt64 = newValue.asInt64;
         }
         if (*asDouble != 0.0) {
             newValue.asDouble += *asDouble;
+            if (respHdr) respHdr->newValue.asDouble = newValue.asDouble;
         }
 
         // create object to populate newValueBuffer.
@@ -672,8 +713,24 @@ MasterService::incrementObject(Key *key,
         Object newObject(key->getTableId(), 0, 0, newValueBuffer);
         updateRejectRules.givenVersion = version;
         updateRejectRules.versionNeGiven = true;
-        *status = objectManager.writeObject(newObject, &updateRejectRules,
-                                            newVersion);
+
+        if (respHdr) {
+            KeyLength pKeyLen;
+            const void* pKey = newObject.getKey(0, &pKeyLen);
+            respHdr->common.status = STATUS_OK;
+            RpcResult rpcResult(
+                    reqHdr->tableId,
+                    Key::getHash(reqHdr->tableId, pKey, pKeyLen),
+                    reqHdr->lease.leaseId, reqHdr->rpcId, reqHdr->ackId,
+                    respHdr, sizeof(*respHdr));
+            *status = objectManager.writeObject(newObject, &updateRejectRules,
+                                                newVersion, NULL,
+                                                &rpcResult, rpcResultPtr);
+        } else {
+            *status = objectManager.writeObject(newObject, &updateRejectRules,
+                                                newVersion);
+        }
+
         if (*status == STATUS_WRONG_VERSION) {
             TEST_LOG("retry after version mismatch");
         } else {
@@ -809,40 +866,45 @@ MasterService::lookupIndexKeys(
  *      The total number of bytes copied into segments for transfer thus
  *      far, which we add to whenever we append any entry to a transfer
  *      segment.
- * \param reqHdr
- *      Header from the incoming RPC request; contains parameters
- *      for this operation.
- * \param[out] respHdr
- *      Header for the response that will be returned to the client.
- *      The caller has pre-allocated the right amount of space in the
- *      response buffer for this type of request, and has zeroed out
- *      its contents (so, for example, status is already zero).
+ * \param tableId
+ *      ID of the table from which objects are being migrated.
+ * \param firstKeyHash
+ *      Lowest key hash that will be migrated.
+ * \param lastKeyHash
+ *      Highest key hash that will be migrated.
+ * \param receiver
+ *      ServerId of the master that is receiving the migration data. Each time
+ *      a transfer segment fills, this server will be sent an RPC containing
+ *      the data.
  * \return
- *      Returns 0 on success (either the entry is ignored or successfully added
- *      to the segment) and 1 on failure (an entry could not be successfully
- *      appended to an empty segment).
+ *      Returns STATUS_OK on success (either the entry is ignored or
+ *      successfully added to the segment) or another status failure (an entry
+ *      could not be successfully appended to an empty segment).
  */
-int
+Status
 MasterService::migrateSingleLogEntry(
-        LogIterator& it,
+        SegmentIterator& it,
         Tub<Segment>& transferSeg,
         uint64_t entryTotals[],
         uint64_t& totalBytes,
-        const WireFormat::MigrateTablet::Request* reqHdr,
-        WireFormat::MigrateTablet::Response* respHdr)
+        uint64_t tableId,
+        uint64_t firstKeyHash,
+        uint64_t lastKeyHash,
+        ServerId receiver)
 {
-    uint64_t tableId = reqHdr->tableId;
-    uint64_t firstKeyHash = reqHdr->firstKeyHash;
-    uint64_t lastKeyHash = reqHdr->lastKeyHash;
-    ServerId newOwnerMasterId(reqHdr->newOwnerMasterId);
-
     LogEntryType type = it.getType();
     if (type != LOG_ENTRY_TYPE_OBJ &&
         type != LOG_ENTRY_TYPE_OBJTOMB &&
-        type != LOG_ENTRY_TYPE_TXDECISION)
+        type != LOG_ENTRY_TYPE_RPCRESULT &&
+        type != LOG_ENTRY_TYPE_PREP &&
+        type != LOG_ENTRY_TYPE_PREPTOMB &&
+        type != LOG_ENTRY_TYPE_TXDECISION &&
+        type != LOG_ENTRY_TYPE_TXPLIST)
     {
         // We aren't interested in any other types.
-        return 0;
+        TEST_LOG("Ignoring log entry type %s",
+                LogEntryTypeHelpers::toString(type));
+        return STATUS_OK;
     }
 
     Buffer buffer;
@@ -854,27 +916,62 @@ MasterService::migrateSingleLogEntry(
         Key key(type, buffer);
         entryTableId = key.getTableId();
         entryKeyHash = key.getHash();
+    } else if (type == LOG_ENTRY_TYPE_RPCRESULT) {
+        RpcResult rpcResult(buffer);
+        entryTableId = rpcResult.getTableId();
+        entryKeyHash = rpcResult.getKeyHash();
+    } else if (type == LOG_ENTRY_TYPE_PREP) {
+        PreparedOp op(buffer, 0, buffer.size());
+        entryTableId = op.object.getTableId();
+        entryKeyHash = Key::getHash(tableId,
+                                    op.object.getKey(),
+                                    op.object.getKeyLength());
+    } else if (type == LOG_ENTRY_TYPE_PREPTOMB) {
+        PreparedOpTombstone opTomb(buffer, 0);
+        entryTableId = opTomb.header.tableId;
+        entryKeyHash = opTomb.header.keyHash;
     } else if (type == LOG_ENTRY_TYPE_TXDECISION) {
         TxDecisionRecord record(buffer);
         entryTableId = record.getTableId();
         entryKeyHash = record.getKeyHash();
+    } else if (type == LOG_ENTRY_TYPE_TXPLIST) {
+        ParticipantList participantList(buffer);
+        for (uint64_t i = 0; i < participantList.header.participantCount; ++i) {
+            entryTableId = participantList.participants[i].tableId;
+            entryKeyHash = participantList.participants[i].keyHash;
+            if (entryTableId != tableId)
+                continue;
+            if (entryKeyHash < firstKeyHash || entryKeyHash > lastKeyHash)
+                continue;
+            break;
+        }
     }
 
     // Skip if not applicable.
-    if (entryTableId != tableId)
-        return 0;
+    if (entryTableId != tableId) {
+        TEST_LOG("%s not migrated; tableId doesn't match",
+                LogEntryTypeHelpers::toString(type));
+        return STATUS_OK;
+    }
 
-    if (entryKeyHash < firstKeyHash || entryKeyHash > lastKeyHash)
-        return 0;
+    // TODO(stutsman) May want to hold back on computing hashes until here?
+
+    if (entryKeyHash < firstKeyHash || entryKeyHash > lastKeyHash) {
+        TEST_LOG("%s not migrated; keyHash not in range",
+                LogEntryTypeHelpers::toString(type));
+        return STATUS_OK;
+    }
+
 
     if (type == LOG_ENTRY_TYPE_OBJ) {
-        // Only send objects when they're currently in the hash table.
-        // Otherwise they're dead.
-        Key key(type, buffer);
-        if (!objectManager.keyPointsAtReference(key,
-                    it.getReference())) {
-            return 0;
-        }
+        // Note: there used to be code here to ignore objects that aren't
+        // pointed to by the hash table, under the assumption that they are
+        // dead. However, this doesn't work in the presence of concurrent
+        // cleaning: the cleaner may have moved an object to a side segment
+        // that is not yet visible. Thus, we must send objects even if they
+        // don't appear to be alive. If an object really is dead, we will
+        // also send a tombstone, which will allow the object to be filtered at
+        // the destination.
 
     } else if (type == LOG_ENTRY_TYPE_OBJTOMB) {
         // We must always send tombstones, since an object we may have sent
@@ -884,7 +981,7 @@ MasterService::migrateSingleLogEntry(
 
         // Note that we can do better. The stupid way
         // is to track each object or tombstone we've sent. The smarter
-        // way is to just record the Log::Position when we started
+        // way is to just record the LogPosition when we started
         // iterating and only send newer tombstones.
     }
 
@@ -893,12 +990,15 @@ MasterService::migrateSingleLogEntry(
 
     if (!transferSeg)
         transferSeg.construct();
+
     // If we can't fit it, send the current buffer and retry.
     if (!transferSeg->append(type, buffer)) {
         transferSeg->close();
         LOG(DEBUG, "Sending migration segment");
-        MasterClient::receiveMigrationData(context, newOwnerMasterId,
-                transferSeg.get(), tableId, firstKeyHash);
+        if (expect_true(receiver != ServerId{})) {
+            MasterClient::receiveMigrationData(context, receiver,
+                    transferSeg.get(), tableId, firstKeyHash);
+        }
 
         transferSeg.destroy();
         transferSeg.construct();
@@ -908,11 +1008,13 @@ MasterService::migrateSingleLogEntry(
             LOG(ERROR, "Tablet migration failed: could not fit object "
                     "into empty segment (obj bytes %u)",
                     buffer.size());
-            respHdr->common.status = STATUS_INTERNAL_ERROR;
-            return 1;
+            return STATUS_INTERNAL_ERROR;
         }
     }
-    return 0;
+
+    TEST_LOG("Migrated log entry type %s",
+            LogEntryTypeHelpers::toString(type));
+    return STATUS_OK;
 }
 
 /**
@@ -931,7 +1033,11 @@ MasterService::migrateTablet(const WireFormat::MigrateTablet::Request* reqHdr,
     uint64_t tableId = reqHdr->tableId;
     uint64_t firstKeyHash = reqHdr->firstKeyHash;
     uint64_t lastKeyHash = reqHdr->lastKeyHash;
-    ServerId newOwnerMasterId(reqHdr->newOwnerMasterId);
+    ServerId receiver(reqHdr->newOwnerMasterId);
+
+    // Mark this request as read-only, to avoid deadlock when performing
+    // epoch-related waits below.
+    rpc->worker->rpc->activities = Transport::ServerRpc::READ_ACTIVITY;
 
     // Find the tablet we're trying to move. We only support migration
     // when the tablet to be migrated consists of a range within a single,
@@ -945,7 +1051,7 @@ MasterService::migrateTablet(const WireFormat::MigrateTablet::Request* reqHdr,
         return;
     }
 
-    if (newOwnerMasterId == serverId) {
+    if (receiver == serverId) {
         LOG(WARNING, "Migrating to myself doesn't make much sense");
         respHdr->common.status = STATUS_REQUEST_FORMAT_ERROR;
         return;
@@ -957,14 +1063,14 @@ MasterService::migrateTablet(const WireFormat::MigrateTablet::Request* reqHdr,
     // there was no way of figuring that out before. Perhaps we can use the
     // "new" TableStats mechanism.
 
-    MasterClient::prepForMigration(context, newOwnerMasterId, tableId,
+    MasterClient::prepForMigration(context, receiver, tableId,
             firstKeyHash, lastKeyHash);
-    Log::Position newOwnerLogHead = MasterClient::getHeadOfLog(
-            context, newOwnerMasterId);
+    LogPosition newOwnerLogHead = MasterClient::getHeadOfLog(
+            context, receiver);
 
     LOG(NOTICE, "Migrating tablet [0x%lx,0x%lx] in tableId %lu to %s",
         firstKeyHash, lastKeyHash, tableId,
-        context->serverList->toString(newOwnerMasterId).c_str());
+        context->serverList->toString(receiver).c_str());
 
     // We'll send over objects in Segment containers for better network
     // efficiency and convenience.
@@ -973,15 +1079,24 @@ MasterService::migrateTablet(const WireFormat::MigrateTablet::Request* reqHdr,
     uint64_t entryTotals[TOTAL_LOG_ENTRY_TYPES] = {0};
     uint64_t totalBytes = 0;
 
-    LogIterator it(*objectManager.getLog(), false);
-    // Scan the log from oldest to newest entries until we reach the head
-    for (; !it.onHead(); it.next()) {
-        int error = migrateSingleLogEntry(
-                it, transferSeg, entryTotals, totalBytes, reqHdr, respHdr);
-        if (error) return;
+    LogIterator it(*objectManager.getLog());
+    // Phase 1: scan the log from oldest to newest entries until we reach
+    // the head segment.
+    if (!it.isDone()) {
+        while (true) {
+            Status error = migrateSingleLogEntry(
+                    *it.getCurrentSegmentIterator(),
+                    transferSeg, entryTotals, totalBytes,
+                    tableId, firstKeyHash, lastKeyHash,
+                    receiver);
+            if (error) return;
+            if (it.onHead())
+                break;
+            it.next();
+        }
     }
 
-    // Phase 2 block new writes and let current writes finish
+    // Phase 2: block new writes and let current writes finish
     if (it.onHead()) {
         tabletManager.changeState(tableId, firstKeyHash, lastKeyHash,
                 TabletManager::NORMAL, TabletManager::LOCKED_FOR_MIGRATION);
@@ -990,33 +1105,35 @@ MasterService::migrateTablet(const WireFormat::MigrateTablet::Request* reqHdr,
         // currently running RPC could have been a part of
         uint64_t epoch = ServerRpcPool<>::incrementCurrentEpoch() - 1;
 
-        // Increase our epoch nuumber to the current epoch number so we do not
-        // wait on ourselves
-        rpc->worker->rpc->epoch = epoch + 1;
-
         // Wait for the remainder of already running writes to finish.
         while (true) {
             uint64_t earliestEpoch =
-                ServerRpcPool<>::getEarliestOutstandingEpoch(context);
+                ServerRpcPool<>::getEarliestOutstandingEpoch(context,
+                        Transport::ServerRpc::APPEND_ACTIVITY);
+            earliestEpoch = std::min(earliestEpoch,
+                        WorkerTimer::getEarliestOutstandingEpoch());
             if (earliestEpoch > epoch)
                 break;
         }
+    }
 
-        // Now we mark the position and finish the migration
-        Log::Position position = objectManager.getLog()->getHead();
-        it.refresh();
-
-        for (; it.getPosition() < position; it.next()) {
-            int error = migrateSingleLogEntry(
-                    it, transferSeg, entryTotals, totalBytes, reqHdr, respHdr);
-            if (error) return;
-        }
+    // Phase 3: finish iterating over the remaining log entries.
+    while (true) {
+        it.next();
+        if (it.isDone())
+            break;
+        Status error = migrateSingleLogEntry(
+                *it.getCurrentSegmentIterator(),
+                transferSeg, entryTotals, totalBytes,
+                tableId, firstKeyHash, lastKeyHash,
+                receiver);
+        if (error) return;
     }
 
     if (transferSeg) {
         transferSeg->close();
         LOG(DEBUG, "Sending last migration segment");
-        MasterClient::receiveMigrationData(context, newOwnerMasterId,
+        MasterClient::receiveMigrationData(context, receiver,
                 transferSeg.get(), tableId, firstKeyHash);
         transferSeg.destroy();
     }
@@ -1026,7 +1143,7 @@ MasterService::migrateTablet(const WireFormat::MigrateTablet::Request* reqHdr,
     // data is all on the other machine and the coordinator knows to use it
     // for any recoveries.
     CoordinatorClient::reassignTabletOwnership(context,
-            tableId, firstKeyHash, lastKeyHash, newOwnerMasterId,
+            tableId, firstKeyHash, lastKeyHash, receiver,
             newOwnerLogHead.getSegmentId(), newOwnerLogHead.getSegmentOffset());
 
     LOG(NOTICE, "Migration succeeded for tablet [0x%lx,0x%lx] in "
@@ -1034,10 +1151,16 @@ MasterService::migrateTablet(const WireFormat::MigrateTablet::Request* reqHdr,
             "%lu bytes in total",
             firstKeyHash, lastKeyHash, tableId, entryTotals[LOG_ENTRY_TYPE_OBJ],
             entryTotals[LOG_ENTRY_TYPE_OBJTOMB],
-            context->serverList->toString(newOwnerMasterId).c_str(),
+            context->serverList->toString(receiver).c_str(),
             totalBytes);
 
-    tabletManager.deleteTablet(tableId, firstKeyHash, lastKeyHash);
+    bool removed = tabletManager.deleteTablet(tableId,
+                                              firstKeyHash,
+                                              lastKeyHash);
+    if (removed) {
+        TableStats::deleteKeyHashRange(&masterTableMetadata, tableId,
+                firstKeyHash, lastKeyHash);
+    }
 
     // Ensure that the ObjectManager never returns objects from this deleted
     // tablet again.
@@ -1381,9 +1504,14 @@ MasterService::multiWrite(const WireFormat::MultiOp::Request* reqHdr,
 
         // Write the object.
         RejectRules rejectRules = currentReq->rejectRules;
-        currentResp->status = objectManager.writeObject(
-                object, &rejectRules, &currentResp->version,
-                &oldObjectBuffers[i]);
+        try {
+            currentResp->status = objectManager.writeObject(
+                    object, &rejectRules, &currentResp->version,
+                    &oldObjectBuffers[i]);
+        }
+        catch (RetryException& e) {
+            currentResp->status = STATUS_RETRY;
+        }
         reqOffset += currentReq->length;
     }
 
@@ -1484,6 +1612,8 @@ MasterService::prepForMigration(
         LOG(NOTICE, "Ready to receive tablet [0x%lx,0x%lx] in tableId %lu from "
                 "\"??\"", reqHdr->firstKeyHash, reqHdr->lastKeyHash,
                 reqHdr->tableId);
+        TableStats::addKeyHashRange(&masterTableMetadata, reqHdr->tableId,
+                reqHdr->firstKeyHash, reqHdr->lastKeyHash);
     } else {
         TabletManager::Tablet tablet;
         if (!tabletManager.getTablet(reqHdr->tableId,
@@ -1616,7 +1746,6 @@ MasterService::receiveMigrationData(
         WireFormat::ReceiveMigrationData::Response* respHdr,
         Rpc* rpc)
 {
-    // TODO(ankitak)
     uint64_t tableId = reqHdr->tableId;
     uint64_t firstKeyHash = reqHdr->firstKeyHash;
     uint32_t segmentBytes = reqHdr->segmentBytes;
@@ -1644,7 +1773,7 @@ MasterService::receiveMigrationData(
         return;
     }
 
-    Segment::Certificate certificate = reqHdr->certificate;
+    SegmentCertificate certificate = reqHdr->certificate;
     rpc->requestPayload->truncateFront(sizeof(*reqHdr));
     if (rpc->requestPayload->size() != segmentBytes + reqHdr->keyLength) {
         LOG(ERROR, "RPC size (%u) does not match advertised length (%u)",
@@ -1689,6 +1818,15 @@ MasterService::remove(const WireFormat::Remove::Request* reqHdr,
         WireFormat::Remove::Response* respHdr,
         Rpc* rpc)
 {
+    assert(reqHdr->rpcId > 0);
+    UnackedRpcHandle rh(&unackedRpcResults,
+                        reqHdr->lease, reqHdr->rpcId, reqHdr->ackId);
+    if (rh.isDuplicate()) {
+        *respHdr = parseRpcResult<WireFormat::Remove>(rh.resultLoc());
+        rpc->sendReply();
+        return;
+    }
+
     const void* stringKey = rpc->requestPayload->getRange(
             sizeof32(*reqHdr), reqHdr->keyLength);
 
@@ -1704,13 +1842,28 @@ MasterService::remove(const WireFormat::Remove::Request* reqHdr,
     // index entries later.
     Buffer oldBuffer;
 
-    // Remove the object.
     RejectRules rejectRules = reqHdr->rejectRules;
-    respHdr->common.status = objectManager.removeObject(
-            key, &rejectRules, &respHdr->version, &oldBuffer);
+    uint64_t rpcResultPtr;
+    respHdr->common.status = STATUS_OK;
+    RpcResult rpcResult(
+            reqHdr->tableId,
+            Key::getHash(reqHdr->tableId, stringKey, reqHdr->keyLength),
+            reqHdr->lease.leaseId, reqHdr->rpcId, reqHdr->ackId,
+            respHdr, sizeof(*respHdr));
 
-    if (respHdr->common.status == STATUS_OK)
+    // Remove the object.
+    respHdr->common.status = objectManager.removeObject(
+            key, &rejectRules, &respHdr->version, &oldBuffer,
+            &rpcResult, &rpcResultPtr);
+
+    if (respHdr->common.status == STATUS_OK &&
+        respHdr->version != VERSION_NONEXISTENT) {
         objectManager.syncChanges();
+        rh.recordCompletion(rpcResultPtr); // Complete only if RpcResult is
+                                           // written.
+                                           // Otherwise, RPC state should reset
+                                           // especially for STATUS_RETRY.
+    }
 
     // Respond to the client RPC now. Removing old index entries can be
     // done asynchronously while maintaining strong consistency.
@@ -1866,7 +2019,7 @@ MasterService::requestRemoveIndexEntries(Object& object)
  * If there is an error, this method will set the status code of the response
  * to the client to be an error.
  *
- * \param newOwnerMasterId
+ * \param receiver
  *      Identifier for the master that will receive the split indexlet.
  * \param tableId
  *      Identifier for the table.
@@ -1905,7 +2058,7 @@ MasterService::requestRemoveIndexEntries(Object& object)
  */
 int
 MasterService::migrateSingleIndexObject(
-        ServerId newOwnerMasterId, uint64_t tableId, uint8_t indexId,
+        ServerId receiver, uint64_t tableId, uint8_t indexId,
         uint64_t currentBackingTableId, uint64_t newBackingTableId,
         const void* splitKey, uint16_t splitKeyLength,
         LogIterator& it,
@@ -1932,29 +2085,35 @@ MasterService::migrateSingleIndexObject(
         return 0;
     }
 
-    if (!indexletManager.isGreaterOrEqual(indexNodeKey, tableId, indexId,
-            splitKey, splitKeyLength)) {
-        LOG(DEBUG, "Found entry that doesn't belong to "
-                "the partition being migrated. Continuing to the next.");
-        return 0;
-    }
-
     // TODO(ankitak): See if I can get away with only logEntryBuffer.
     Buffer dataBufferToTransfer;
 
     if (type == LOG_ENTRY_TYPE_OBJ) {
-        // Only send objects when they're currently in the hash table.
-        // Otherwise they're dead.
-        if (!objectManager.keyPointsAtReference(
-                indexNodeKey, it.getReference())) {
+        // Note: there used to be code here to ignore objects that aren't
+        // pointed to by the hash table, under the assumption that they are
+        // dead. However, this doesn't work in the presence of concurrent
+        // cleaning: the cleaner may have moved an object to a side segment
+        // that is not yet visible. Thus, we must send objects even if they
+        // ddon't appear to be alive. If an object really is dead, we will
+        // also send a tombstone, which will allow the object to be filtered at
+        // the destination.
+
+        Object object(logEntryBuffer);
+        Buffer nodeObjectValue;
+        object.appendValueToBuffer(&nodeObjectValue);
+
+        if (!indexletManager.isGreaterOrEqual(
+                &nodeObjectValue, splitKey, splitKeyLength)) {
+            LOG(DEBUG, "Found entry that doesn't belong to "
+                    "the partition being migrated. Continuing to the next.");
             return 0;
         }
 
-        totalObjects++;
-
-        Object object(logEntryBuffer);
+        LOG(DEBUG, "Migrating an index entry.");
         object.changeTableId(newBackingTableId);
         object.assembleForLog(dataBufferToTransfer);
+
+        totalObjects++;
 
     } else {
         // We must always send tombstones, since an object we may have sent
@@ -1964,15 +2123,14 @@ MasterService::migrateSingleIndexObject(
 
         // Note that we can do better. The stupid way
         // is to track each object or tombstone we've sent. The smarter
-        // way is to just record the Log::Position when we started
+        // way is to just record the LogPosition when we started
         // iterating and only send newer tombstones.
-
-        totalTombstones++;
 
         ObjectTombstone tombstone(logEntryBuffer);
         tombstone.changeTableId(newBackingTableId);
         tombstone.assembleForLog(dataBufferToTransfer);
 
+        totalTombstones++;
     }
 
     totalBytes += dataBufferToTransfer.size();
@@ -1989,7 +2147,7 @@ MasterService::migrateSingleIndexObject(
         // by newBackingTableId) and
         // the newOwner has a tablet that spans the entire key hash
         // range of this backing table.
-        MasterClient::receiveMigrationData(context, newOwnerMasterId,
+        MasterClient::receiveMigrationData(context, receiver,
                 transferSeg.get(), newBackingTableId, 0,
                 true, tableId, indexId, splitKey, splitKeyLength);
 
@@ -2024,7 +2182,7 @@ MasterService::splitAndMigrateIndexlet(
         WireFormat::SplitAndMigrateIndexlet::Response* respHdr,
         Rpc* rpc)
 {
-    ServerId newOwnerMasterId(reqHdr->newOwnerId);
+    ServerId receiver(reqHdr->newOwnerId);
     uint64_t tableId = reqHdr->tableId;
     uint8_t indexId = reqHdr->indexId;
     uint64_t currentBackingTableId = reqHdr->currentBackingTableId;
@@ -2032,6 +2190,10 @@ MasterService::splitAndMigrateIndexlet(
     uint16_t splitKeyLength = reqHdr->splitKeyLength;
     void* splitKey = rpc->requestPayload->getRange(
             sizeof32(*reqHdr), splitKeyLength);
+
+    // Mark this request as read-only, to avoid deadlock when performing
+    // epoch-related waits below.
+    rpc->worker->rpc->activities = Transport::ServerRpc::READ_ACTIVITY;
 
     if (splitKey == NULL) {
         throw FatalError(HERE, "Ill-formed RPC in splitAndMigrateIndexlet.");
@@ -2062,7 +2224,7 @@ MasterService::splitAndMigrateIndexlet(
         return;
     }
 
-    if (newOwnerMasterId == serverId) {
+    if (receiver == serverId) {
         LOG(WARNING, "Migrating to myself doesn't make much sense.");
         respHdr->common.status = STATUS_REQUEST_FORMAT_ERROR;
         return;
@@ -2072,7 +2234,7 @@ MasterService::splitAndMigrateIndexlet(
             "indexId %u in tableId %lu from %s (this server) to %s.",
             indexId, tableId,
             context->serverList->toString(serverId).c_str(),
-            context->serverList->toString(newOwnerMasterId).c_str());
+            context->serverList->toString(receiver).c_str());
 
     // We'll send over objects in Segment containers for better network
     // efficiency and convenience.
@@ -2082,17 +2244,23 @@ MasterService::splitAndMigrateIndexlet(
     uint64_t totalTombstones = 0;
     uint64_t totalBytes = 0;
 
-    LogIterator it(*objectManager.getLog(), false);
+    LogIterator it(*objectManager.getLog());
 
-    // Scan the log from oldest to newest entries until we reach the head.
-    for (; !it.isDone(); it.next()) {
-        int error = migrateSingleIndexObject(
-                newOwnerMasterId, tableId, indexId,
-                currentBackingTableId, newBackingTableId,
-                splitKey, splitKeyLength,
-                it, transferSeg, totalObjects, totalTombstones, totalBytes,
-                respHdr);
-        if (error) return;
+    // Phase 1: scan the log from oldest to newest entries until we reach
+    // the head segment.
+    if (!it.isDone()) {
+        while (true) {
+            int error = migrateSingleIndexObject(
+                    receiver, tableId, indexId,
+                    currentBackingTableId, newBackingTableId,
+                    splitKey, splitKeyLength,
+                    it, transferSeg, totalObjects, totalTombstones, totalBytes,
+                    respHdr);
+            if (error) return;
+            if (it.onHead())
+                break;
+            it.next();
+        }
     }
 
     // Phase 2 block new writes and let current writes finish
@@ -2109,37 +2277,36 @@ MasterService::splitAndMigrateIndexlet(
         // currently running RPC could have been a part of
         uint64_t epoch = ServerRpcPool<>::incrementCurrentEpoch() - 1;
 
-        // Increase our epoch nuumber to the current epoch number so we do not
-        // wait on ourselves
-        rpc->worker->rpc->epoch = epoch + 1;
-
         // Wait for the remainder of already running writes to finish.
         while (true) {
             uint64_t earliestEpoch =
-                ServerRpcPool<>::getEarliestOutstandingEpoch(context);
+                ServerRpcPool<>::getEarliestOutstandingEpoch(context,
+                        Transport::ServerRpc::APPEND_ACTIVITY);
+            earliestEpoch = std::min(earliestEpoch,
+                        WorkerTimer::getEarliestOutstandingEpoch());
             if (earliestEpoch > epoch)
                 break;
         }
+    }
 
-        // Now we mark the position and finish the migration
-        Log::Position position = objectManager.getLog()->getHead();
-        it.refresh();
-
-        for (; it.getPosition() < position; it.next()) {
-            int error = migrateSingleIndexObject(
-                    newOwnerMasterId, tableId, indexId,
-                    currentBackingTableId, newBackingTableId,
-                    splitKey, splitKeyLength,
-                    it, transferSeg, totalObjects, totalTombstones, totalBytes,
-                    respHdr);
-            if (error) return;
-        }
+    // Phase 3: finish iterating over the remaining log entries.
+    while (true) {
+        it.next();
+        if (it.isDone())
+            break;
+        int error = migrateSingleIndexObject(
+                receiver, tableId, indexId,
+                currentBackingTableId, newBackingTableId,
+                splitKey, splitKeyLength,
+                it, transferSeg, totalObjects, totalTombstones, totalBytes,
+                respHdr);
+        if (error) return;
     }
 
     if (transferSeg) {
         transferSeg->close();
         LOG(DEBUG, "Sending last migration segment");
-        MasterClient::receiveMigrationData(context, newOwnerMasterId,
+        MasterClient::receiveMigrationData(context, receiver,
                 transferSeg.get(), newBackingTableId, 0,
                 true, tableId, indexId, splitKey, splitKeyLength);
         transferSeg.destroy();
@@ -2220,6 +2387,8 @@ MasterService::takeTabletOwnership(
     if (added) {
         LOG(NOTICE, "Took ownership of new tablet [0x%lx,0x%lx] in tableId %lu",
                 reqHdr->firstKeyHash, reqHdr->lastKeyHash, reqHdr->tableId);
+        TableStats::addKeyHashRange(&masterTableMetadata, reqHdr->tableId,
+                reqHdr->firstKeyHash, reqHdr->lastKeyHash);
     } else {
         TabletManager::Tablet tablet;
         if (tabletManager.getTablet(reqHdr->tableId,
@@ -2378,7 +2547,7 @@ MasterService::txDecision(const WireFormat::TxDecision::Request* reqHdr,
             }
 
             uint64_t opPtr = preparedOps.peekOp(reqHdr->leaseId,
-                                                   participants[i].rpcId);
+                                                participants[i].rpcId);
 
             // Skip if object is not prepared since it is already committed
             // or never prepared (abort-vote in prepare stage).
@@ -2394,7 +2563,7 @@ MasterService::txDecision(const WireFormat::TxDecision::Request* reqHdr,
             objectManager.commitRead(op, opRef);
 
             preparedOps.popOp(reqHdr->leaseId,
-                                 participants[i].rpcId);
+                              participants[i].rpcId);
         }
     } else {
         respHdr->common.status = STATUS_REQUEST_FORMAT_ERROR;
@@ -2410,11 +2579,118 @@ MasterService::txDecision(const WireFormat::TxDecision::Request* reqHdr,
 
     respHdr->common.status = STATUS_OK;
 
-    // Respond to the client RPC now. Removing old index entries can be
-    // done asynchronously while maintaining strong consistency.
+    // Respond to the client RPC now.
     rpc->sendReply();
 }
 
+/**
+ * Top-level server method to handle the TX_REQUEST_ABORT request.
+ *
+ * \param reqHdr
+ *      Header from the incoming RPC request.
+ * \param[out] respHdr
+ *      Header for the response that will be returned to the client.
+ *      The caller has pre-allocated the right amount of space in the
+ *      response buffer for this type of request, and has zeroed out
+ *      its contents (so, for example, status is already zero).
+ * \param rpc
+ *      Complete information about the remote procedure call.
+ */
+void
+MasterService::txRequestAbort(
+        const WireFormat::TxRequestAbort::Request* reqHdr,
+        WireFormat::TxRequestAbort::Response* respHdr,
+        Rpc* rpc)
+{
+    uint32_t reqOffset = sizeof32(*reqHdr);
+
+    // 1. Process participant list.
+    uint32_t participantCount = reqHdr->participantCount;
+    WireFormat::TxParticipant *participants =
+        (WireFormat::TxParticipant*)rpc->requestPayload->getRange(reqOffset,
+                sizeof32(WireFormat::TxParticipant) * participantCount);
+
+    if (participants == NULL) {
+        respHdr->common.status = STATUS_REQUEST_FORMAT_ERROR;
+        rpc->sendReply();
+        return;
+    }
+
+    // log should be synced with backup before destruction of handles.
+    std::vector<UnackedRpcHandle> rpcHandles;
+    rpcHandles.reserve(participantCount);
+
+    respHdr->common.status = STATUS_OK;
+    respHdr->vote = WireFormat::TxPrepare::PREPARED;
+
+    // Ensure that at-lease one abort-vote is durably saved in log or
+    // all participants have prepared-votes in durable log.
+    for (uint32_t i = 0; i < participantCount; i++) {
+        uint64_t tableId = participants[i].tableId;
+        uint64_t rpcId = participants[i].rpcId;
+        uint64_t keyHash = participants[i].keyHash;
+
+        // If the tablet doesn't exist in the NORMAL state,
+        // we must plead ignorance.
+        TabletManager::Tablet tablet;
+        if (!tabletManager.getTablet(tableId, keyHash, &tablet) ||
+            tablet.state != TabletManager::NORMAL) {
+            respHdr->common.status = STATUS_UNKNOWN_TABLET;
+            rpc->sendReply();
+            return;
+        }
+
+        WireFormat::ClientLease clientLease = {reqHdr->leaseId,
+                                               0,       // No expiration info.
+                                               0};      // No timestamp info.
+        rpcHandles.emplace_back(&unackedRpcResults,
+                                clientLease,
+                                rpcId,
+                                0 /* No info about AckId */);
+        //TODO(seojin): what is best for the temporary leaseTerm?
+        UnackedRpcHandle* rh = &rpcHandles.back();
+        if (rh->isDuplicate()) {
+            respHdr->vote = parsePrepRpcResult(rh->resultLoc());
+            if (respHdr->vote == WireFormat::TxPrepare::PREPARED) {
+                continue;
+            } else if (respHdr->vote == WireFormat::TxPrepare::ABORT) {
+                break;
+            } else {
+                assert(false);
+            }
+        }
+
+        uint64_t rpcResultPtr;
+        WireFormat::TxPrepare::Vote vote = WireFormat::TxPrepare::ABORT;
+        RpcResult rpcResult(
+                tableId,
+                keyHash,
+                reqHdr->leaseId, rpcId, 0,
+                &vote, sizeof(vote));
+
+        try {
+            objectManager.writePrepareFail(&rpcResult, &rpcResultPtr);
+        } catch (RetryException& e) {
+            objectManager.syncChanges();
+            throw;
+        }
+
+        respHdr->vote = WireFormat::TxPrepare::ABORT;
+        rh->recordCompletion(rpcResultPtr);
+        break;
+    }
+
+    // By design, our response will be shorter than the request. This ensures
+    // that the response can go back in a single RPC.
+    assert(rpc->replyPayload->size() <= Transport::MAX_RPC_LEN);
+
+    // All of the individual writes were done asynchronously. Sync the objects
+    // now to propagate them in bulk to backups.
+    objectManager.syncChanges();
+
+    // Respond to the client RPC now.
+    rpc->sendReply();
+}
 
 /**
  * Top-level server method to handle the TX_HINT_FAILED request.
@@ -2465,16 +2741,44 @@ MasterService::txPrepare(const WireFormat::TxPrepare::Request* reqHdr,
 
     reqOffset += sizeof32(WireFormat::TxParticipant) * participantCount;
 
-    if (participants == NULL) {
+    if (participantCount == 0 || participants == NULL) {
         respHdr->common.status = STATUS_REQUEST_FORMAT_ERROR;
         rpc->sendReply();
         return;
     }
 
+    ParticipantList participantList(participants,
+                                    participantCount,
+                                    reqHdr->lease.leaseId,
+                                    reqHdr->clientTxId);
+    TransactionId txId = participantList.getTransactionId();
+    {
+        // Scope to ensure the paricipantList is tracked before processing
+        // the prepareOps.
+        UnackedRpcHandle participantListHandle(&unackedRpcResults,
+                                               reqHdr->lease,
+                                               reqHdr->clientTxId,
+                                               reqHdr->ackId);
+        if (!participantListHandle.isDuplicate()) {
+            uint64_t logRef = 0;
+            Status status =
+                    objectManager.logTransactionParticipantList(
+                                                    participantList, &logRef);
+            if (status == STATUS_OK) {
+                participantListHandle.recordCompletion(logRef);
+            } else {
+                respHdr->common.status = status;
+                rpc->sendReply();
+                return;
+            }
+        }
+    }
+
     // 2. Process operations.
     uint32_t numRequests = reqHdr->opCount;
+    uint32_t numReadOnly = 0;
 
-    updateClusterTime(reqHdr->lease.timestamp);
+    clusterClock.updateClock(ClusterTime(reqHdr->lease.timestamp));
 
     // log should be synced with backup before destruction of handles.
     std::vector<UnackedRpcHandle> rpcHandles;
@@ -2516,8 +2820,8 @@ MasterService::txPrepare(const WireFormat::TxPrepare::Request* reqHdr,
             buffer.appendExternal(rpc->requestPayload, reqOffset,
                                   currentReq->keyLength);
 
-            op.construct(*type, reqHdr->lease.leaseId, rpcId,
-                         participantCount, participants,
+            op.construct(*type, txId.clientLeaseId, txId.clientTransactionId,
+                         rpcId,
                          tableId, 0, 0,
                          buffer);
 
@@ -2546,8 +2850,8 @@ MasterService::txPrepare(const WireFormat::TxPrepare::Request* reqHdr,
             buffer.appendExternal(rpc->requestPayload, reqOffset,
                                   currentReq->keyLength);
 
-            op.construct(*type, reqHdr->lease.leaseId, rpcId,
-                         participantCount, participants,
+            op.construct(*type, txId.clientLeaseId, txId.clientTransactionId,
+                         rpcId,
                          tableId, 0, 0,
                          buffer);
 
@@ -2568,23 +2872,64 @@ MasterService::txPrepare(const WireFormat::TxPrepare::Request* reqHdr,
             tableId = currentReq->tableId;
             rpcId = currentReq->rpcId;
             rejectRules = currentReq->rejectRules;
-            op.construct(*type, reqHdr->lease.leaseId, rpcId,
-                         participantCount, participants,
+            op.construct(*type, txId.clientLeaseId, txId.clientTransactionId,
+                         rpcId,
                          tableId, 0, 0,
                          *(rpc->requestPayload), reqOffset,
                          currentReq->length);
 
             reqOffset += currentReq->length;
+        } else if (*type == WireFormat::TxPrepare::READONLY) {
+            numReadOnly++;
+            const WireFormat::TxPrepare::Request::ReadOp *currentReq =
+                    rpc->requestPayload->getOffset<
+                    WireFormat::TxPrepare::Request::ReadOp>(reqOffset);
+
+            reqOffset += sizeof32(WireFormat::TxPrepare::Request::ReadOp);
+
+            if (currentReq == NULL || rpc->requestPayload->size() <
+                                      reqOffset + currentReq->keyLength) {
+                respHdr->common.status = STATUS_REQUEST_FORMAT_ERROR;
+                respHdr->vote = WireFormat::TxPrepare::ABORT;
+                break;
+            }
+            tableId = currentReq->tableId;
+            rpcId = currentReq->rpcId;
+            rejectRules = currentReq->rejectRules;
+
+            buffer.emplaceAppend<KeyCount>((unsigned char) 1);
+            buffer.emplaceAppend<CumulativeKeyLength>(currentReq->keyLength);
+            buffer.appendExternal(rpc->requestPayload, reqOffset,
+                                  currentReq->keyLength);
+
+            op.construct(*type, txId.clientLeaseId, txId.clientTransactionId,
+                         rpcId,
+                         tableId, 0, 0,
+                         buffer);
+
+            reqOffset += currentReq->keyLength;
+
+            // Since we prepare not to write anything on log and sync with
+            // backup and it is still safe without linearizability,
+            // we skip all linearizability mechanism for READONLY transactions.
+            bool isCommitVote;
+            respHdr->common.status = objectManager.prepareReadOnly(
+                    *op, &rejectRules, &isCommitVote);
+            if (!isCommitVote || respHdr->common.status != STATUS_OK) {
+                respHdr->vote = WireFormat::TxPrepare::ABORT;
+                break;
+            }
+            respHdr->vote = WireFormat::TxPrepare::PREPARED;
+            continue;
         } else {
             respHdr->common.status = STATUS_REQUEST_FORMAT_ERROR;
             break;
         }
 
         rpcHandles.emplace_back(&unackedRpcResults,
-                                reqHdr->lease.leaseId,
+                                reqHdr->lease,
                                 rpcId,
-                                reqHdr->ackId,
-                                reqHdr->lease.leaseExpiration);
+                                reqHdr->ackId);
         UnackedRpcHandle* rh = &rpcHandles.back();
         if (rh->isDuplicate()) {
             respHdr->vote = parsePrepRpcResult(rh->resultLoc());
@@ -2630,6 +2975,53 @@ MasterService::txPrepare(const WireFormat::TxPrepare::Request* reqHdr,
         rh->recordCompletion(rpcResultPtr);
     }
 
+    // when it is a single server transaction, we commit the transaction
+    // preemptively, so that a client doesn't need to send decision RPC.
+    // Assume that if there is at least one READ-ONLY request they should all
+    // be READ-ONLY and thus not need a decision phase.
+    if (numReadOnly == 0 && numRequests == participantCount &&
+            respHdr->common.status == STATUS_OK &&
+            respHdr->vote == WireFormat::TxPrepare::PREPARED) {
+        for (uint32_t i = 0; i < participantCount; ++i) {
+            uint64_t opPtr = preparedOps.peekOp(reqHdr->lease.leaseId,
+                                                   participants[i].rpcId);
+
+            // Skip if object is not prepared since it is already committed.
+            if (!opPtr) {
+                continue;
+            }
+
+            Buffer opBuffer;
+            Log::Reference opRef(opPtr);
+            objectManager.getLog()->getEntry(opRef, opBuffer);
+            PreparedOp op(opBuffer, 0, opBuffer.size());
+
+            Status status;
+
+            if (op.header.type == WireFormat::TxPrepare::READ) {
+                status = objectManager.commitRead(op, opRef);
+            } else if (op.header.type == WireFormat::TxPrepare::REMOVE) {
+                status = objectManager.commitRemove(op, opRef);
+            } else if (op.header.type == WireFormat::TxPrepare::WRITE) {
+                status = objectManager.commitWrite(op, opRef);
+            }
+
+            // When an error happens in preemptive commit, we just respond
+            // with the regular response (vote == PREPARED) to the prepare RPC.
+            // Possible causes are tablet migration and slow log cleaner.
+            // All of them can be resolved by retry of txDecision.
+            if (status != STATUS_OK) {
+                objectManager.syncChanges();
+                rpc->sendReply();
+                return;
+            }
+
+            preparedOps.popOp(reqHdr->lease.leaseId,
+                                 participants[i].rpcId);
+        }
+        respHdr->vote = WireFormat::TxPrepare::COMMITTED;
+    }
+
     // By design, our response will be shorter than the request. This ensures
     // that the response can go back in a single RPC.
     assert(rpc->replyPayload->size() <= Transport::MAX_RPC_LEN);
@@ -2653,20 +3045,13 @@ MasterService::write(const WireFormat::Write::Request* reqHdr,
         WireFormat::Write::Response* respHdr,
         Rpc* rpc)
 {
-    const bool linearizable = reqHdr->rpcId > 0;
-    if (linearizable) {
-        updateClusterTime(reqHdr->lease.timestamp);
-
-        void* result;
-        if (unackedRpcResults.checkDuplicate(reqHdr->lease.leaseId,
-                                             reqHdr->rpcId,
-                                             reqHdr->ackId,
-                                             reqHdr->lease.leaseExpiration,
-                                             &result)) {
-            *respHdr = parseRpcResult<WireFormat::Write>(result);
-            rpc->sendReply();
-            return;
-        }
+    assert(reqHdr->rpcId > 0);
+    UnackedRpcHandle rh(&unackedRpcResults,
+                        reqHdr->lease, reqHdr->rpcId, reqHdr->ackId);
+    if (rh.isDuplicate()) {
+        *respHdr = parseRpcResult<WireFormat::Write>(rh.resultLoc());
+        rpc->sendReply();
+        return;
     }
 
     // This is a temporary object that has an invalid version and timestamp.
@@ -2687,31 +3072,27 @@ MasterService::write(const WireFormat::Write::Request* reqHdr,
     // Write the object.
     RejectRules rejectRules = reqHdr->rejectRules;
 
+    // Prepare linearizability information.
     uint64_t rpcResultPtr;
-    if (linearizable) {
-        KeyLength pKeyLen;
-        const void* pKey = object.getKey(0, &pKeyLen);
-        respHdr->common.status = STATUS_OK;
-        RpcResult rpcResult(
-                reqHdr->tableId, Key::getHash(reqHdr->tableId, pKey, pKeyLen),
-                reqHdr->lease.leaseId, reqHdr->rpcId, reqHdr->ackId,
-                respHdr, sizeof(*respHdr));
+    KeyLength pKeyLen;
+    const void* pKey = object.getKey(0, &pKeyLen);
+    respHdr->common.status = STATUS_OK;
+    RpcResult rpcResult(
+            reqHdr->tableId, Key::getHash(reqHdr->tableId, pKey, pKeyLen),
+            reqHdr->lease.leaseId, reqHdr->rpcId, reqHdr->ackId,
+            respHdr, sizeof(*respHdr));
 
-        respHdr->common.status = objectManager.writeObject(
-                object, &rejectRules, &respHdr->version, &oldObjectBuffer,
-                &rpcResult, &rpcResultPtr);
-    } else {
-        respHdr->common.status = objectManager.writeObject(
-                object, &rejectRules, &respHdr->version, &oldObjectBuffer);
-    }
+    // Write the object.
+    respHdr->common.status = objectManager.writeObject(
+            object, &rejectRules, &respHdr->version, &oldObjectBuffer,
+            &rpcResult, &rpcResultPtr);
 
-    if (respHdr->common.status == STATUS_OK)
+    if (respHdr->common.status == STATUS_OK) {
         objectManager.syncChanges();
-
-    if (linearizable) {
-        unackedRpcResults.recordCompletion(reqHdr->lease.leaseId,
-                                    reqHdr->rpcId,
-                                    reinterpret_cast<void*>(rpcResultPtr));
+        rh.recordCompletion(rpcResultPtr); // Complete only if RpcResult is
+                                           // written.
+                                           // Otherwise, RPC state should reset
+                                           // especially for STATUS_RETRY.
     }
 
     // If this is a overwrite, delete old index entries if any (this can
@@ -2975,7 +3356,7 @@ MasterService::recover(uint64_t recoveryId, ServerId masterId,
                     context->serverList->toString(
                             task->replica.backupId).c_str());
             try {
-                Segment::Certificate certificate = task->rpc->wait();
+                SegmentCertificate certificate = task->rpc->wait();
                 task->rpc.destroy();
                 uint64_t grdTime = Cycles::rdtsc() - task->startTime;
                 metrics->master.segmentReadTicks += grdTime;
@@ -3247,20 +3628,20 @@ MasterService::recover(const WireFormat::Recover::Request* reqHdr,
                     newTablet.table_id(),
                     newTablet.start_key_hash(), newTablet.end_key_hash(),
                     tabletManager.toString().c_str()));
+        } else {
+            TableStats::addKeyHashRange(&masterTableMetadata,
+                    newTablet.table_id(), newTablet.start_key_hash(),
+                    newTablet.end_key_hash());
         }
     }
 
     // Update the cluster time.  To guarantee the safety of linearizable rpcs,
     // this update must occur before requests for recovered data are serviced.
     WireFormat::ClientLease clientLease = getLeaseInfoRpc.wait();
-    uint64_t currentClusterTime = clusterTime;
-    while (currentClusterTime < clientLease.timestamp) {
-        currentClusterTime = clusterTime.compareExchange(currentClusterTime,
-                                                         clientLease.timestamp);
-    }
+    clusterClock.updateClock(ClusterTime(clientLease.timestamp));
 
     // Record the log position before recovery started.
-    Log::Position headOfLog = objectManager.getLog()->rollHeadOver();
+    LogPosition headOfLog = objectManager.getLog()->rollHeadOver();
 
     // Recover Segments, firing ObjectManager::replaySegment for each one.
     bool successful = false;
@@ -3382,8 +3763,14 @@ MasterService::recover(const WireFormat::Recover::Request* reqHdr,
         // recovery before starting to serve requests again.
         foreach (const ProtoBuf::Tablets::Tablet& tablet,
                 recoveryPartition.tablet()) {
-            tabletManager.deleteTablet(tablet.table_id(),
+            bool removed = tabletManager.deleteTablet(tablet.table_id(),
                     tablet.start_key_hash(), tablet.end_key_hash());
+            if (removed) {
+                TableStats::deleteKeyHashRange(&masterTableMetadata,
+                        tablet.table_id(), tablet.start_key_hash(),
+                        tablet.end_key_hash());
+            }
+
         }
         foreach (const ProtoBuf::Indexlet& indexlet,
                 recoveryPartition.indexlet()) {

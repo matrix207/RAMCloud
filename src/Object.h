@@ -1,4 +1,4 @@
-/* Copyright (c) 2010-2014 Stanford University
+/* Copyright (c) 2010-2015 Stanford University
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -16,7 +16,6 @@
 #ifndef RAMCLOUD_OBJECT_H
 #define RAMCLOUD_OBJECT_H
 
-#include "Common.h"
 #include "Buffer.h"
 #include "Key.h"
 
@@ -92,7 +91,7 @@ class Object {
 
     void assembleForLog(Buffer& buffer);
     void assembleForLog(void* buffer);
-    void appendValueToBuffer(Buffer* buffer, uint32_t valueOffset = 0);
+    void appendValueToBuffer(Buffer* buffer);
     static void appendKeysAndValueToBuffer(
             uint64_t tableId, KeyCount numKeys, KeyInfo *keyList,
             const void* value, uint32_t valueLength, Buffer* request,
@@ -118,7 +117,7 @@ class Object {
     const void* getKeysAndValue();
     KeyCount getKeyCount();
     const void* getValue(uint32_t *valueLength = NULL);
-    bool getValueOffset(uint16_t *offset);
+    bool getValueOffset(uint32_t *offset);
     uint32_t getValueLength();
 
     uint32_t getKeysAndValueLength();

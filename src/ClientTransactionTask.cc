@@ -13,8 +13,14 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
+#include "ClientLeaseAgent.h"
+#include "ClientTransactionManager.h"
 #include "ClientTransactionTask.h"
+#include "Context.h"
+#include "ObjectFinder.h"
 #include "RamCloud.h"
+#include "RpcTracker.h"
+#include "ShortMacros.h"
 
 namespace RAMCloud {
 
@@ -26,6 +32,7 @@ namespace RAMCloud {
  */
 ClientTransactionTask::ClientTransactionTask(RamCloud* ramcloud)
     : ramcloud(ramcloud)
+    , readOnly(true)
     , participantCount(0)
     , participantList()
     , state(INIT)
@@ -36,8 +43,8 @@ ClientTransactionTask::ClientTransactionTask(RamCloud* ramcloud)
     , decisionRpcs()
     , commitCache()
     , nextCacheEntry()
-    , poller()
 {
+    RAMCLOUD_TEST_LOG("Constructor called.");
 }
 
 /**
@@ -95,7 +102,7 @@ ClientTransactionTask::insertCacheEntry(Key& key, const void* buf,
 {
     CacheKey cacheKey = {key.getTableId(), key.getHash()};
     CommitCacheMap::iterator it = commitCache.insert(
-            std::make_pair(cacheKey, CacheEntry()));
+            CommitCacheMap::value_type(cacheKey, CacheEntry()));
     it->second.objectBuf = new ObjectBuffer();
     Object::appendKeysAndValueToBuffer(
             key, buf, length, it->second.objectBuf, true);
@@ -106,14 +113,10 @@ ClientTransactionTask::insertCacheEntry(Key& key, const void* buf,
  * Make incremental progress toward committing the transaction.  This method
  * is called during the poll loop when this task needs to make progress (i.e.
  * if the transaction is in the process of committing).
- * \return
- *      0 means no progress was made in this call; 1 means we did something
- *      useful.
  */
-int
+void
 ClientTransactionTask::performTask()
 {
-    int foundWork = 0;
     try {
         if (state == INIT) {
             // Build participant list
@@ -122,33 +125,58 @@ ClientTransactionTask::performTask()
             state = PREPARE;
         }
         if (state == PREPARE) {
-            foundWork |= sendPrepareRpc();
-            foundWork |= processPrepareRpcResults();
+            sendPrepareRpc();
+            processPrepareRpcResults();
             if (prepareRpcs.empty() && nextCacheEntry == commitCache.end()) {
-                nextCacheEntry = commitCache.begin();
-                if (decision != WireFormat::TxDecision::ABORT) {
-                    decision = WireFormat::TxDecision::COMMIT;
+                switch (decision) {
+                    case WireFormat::TxDecision::UNDECIDED:
+                        decision = WireFormat::TxDecision::COMMIT;
+                        TEST_LOG("Set decision to COMMIT.");
+                        // NO break; fall through to...
+                    case WireFormat::TxDecision::ABORT:
+                        if (!readOnly) {
+                            nextCacheEntry = commitCache.begin();
+                            state = DECISION;
+                            TEST_LOG("Move from PREPARE to DECISION phase.");
+                            break;
+                        }
+                        // NO break; fall through to...
+                    case WireFormat::TxDecision::COMMIT:
+                        // Prepare must have returned COMMITTED or was READ-ONLY
+                        // so the transaction is now done.
+                        ramcloud->rpcTracker->rpcFinished(txId);
+                        state = DONE;
+                        TEST_LOG("Move from PREPARE to DONE phase; optimized.");
+                        break;
+                    default:
+                        RAMCLOUD_LOG(ERROR,
+                                     "Unexpected transaction decision value.");
+                        ClientException::throwException(HERE,
+                                                        STATUS_INTERNAL_ERROR);
+                        break;
                 }
-                state = DECISION;
             }
         }
         if (state == DECISION) {
-            foundWork |= sendDecisionRpc();
-            foundWork |= processDecisionRpcResults();
+            sendDecisionRpc();
+            processDecisionRpcResults();
             if (decisionRpcs.empty() && nextCacheEntry == commitCache.end()) {
-                ramcloud->rpcTracker.rpcFinished(txId);
+                ramcloud->rpcTracker->rpcFinished(txId);
                 state = DONE;
             }
         }
     } catch (ClientException& e) {
         // If there are any unexpected problems with the commit protocol, STOP.
         // This shouldn't happen unless there is a bug.
-        foundWork = 1;
         prepareRpcs.clear();
         decisionRpcs.clear();
         switch (state) {
             case INIT:
             case PREPARE:
+                // If there is an error during the prepare, the "decision" that
+                // is currently set may be in error.  Reset the decision to
+                // UNDECIDED to signal the error.
+                decision = WireFormat::TxDecision::UNDECIDED;
                 RAMCLOUD_LOG(ERROR,
                         "Unexpected exception '%s' while preparing "
                         "transaction commit; will result in internal error.",
@@ -166,65 +194,9 @@ ClientTransactionTask::performTask()
                         "transaction.",
                         statusToString(e.status));
         }
-        ramcloud->rpcTracker.rpcFinished(txId);
+        ramcloud->rpcTracker->rpcFinished(txId);
         state = DONE;
     }
-    return foundWork;
-}
-
-/**
- * Schedule a ClientTransactionTask to start executing the commit protocol.
- *
- * \param taskPtr
- *      Shared pointer to the ClientTransactionTask to be run.
- */
-void
-ClientTransactionTask::start(std::shared_ptr<ClientTransactionTask>& taskPtr)
-{
-    assert(taskPtr);
-    ClientTransactionTask* task = taskPtr.get();
-    if (!task->poller) {
-        task->poller.construct(task->ramcloud->clientContext->dispatch,
-                               taskPtr);
-    }
-}
-
-/**
- * Construct a Poller causing a specified ClientTransactionTask to be run.
- *
- * \param dispatch
- *      Dispatch object through which the poller will be invoked.
- * \param taskPtr
- *      ClientTransactionTask to be run.
- */
-ClientTransactionTask::Poller::Poller(Dispatch* dispatch,
-        std::shared_ptr<ClientTransactionTask>& taskPtr)
-    : Dispatch::Poller(dispatch, "ClientTransactionTask::Poller")
-    , running(false)
-    , taskPtr(taskPtr)
-{}
-
-/**
- * Drives the execution of the ClientTransactionTask's rules engine.
- */
-int
-ClientTransactionTask::Poller::poll()
-{
-    int foundWork = 0;
-
-    // Make sure the recursive calls don't execute.
-    if (!running) {
-        running = true;
-        ClientTransactionTask* task = taskPtr.get();
-        foundWork |= task->performTask();
-        running = false;
-
-        // Destroy poller (self) if task is complete; must be last action.
-        if (task->isReady()) {
-            task->poller.destroy();
-        }
-    }
-    return foundWork;
 }
 
 /**
@@ -236,8 +208,10 @@ ClientTransactionTask::Poller::poll()
 void
 ClientTransactionTask::initTask()
 {
-    lease = ramcloud->clientLease.getLease();
-    txId = ramcloud->rpcTracker.newRpcIdBlock(this, commitCache.size());
+    lease = ramcloud->clientLeaseAgent->getLease();
+    // First RPC id is used to identify the transaction.  One additional RPC
+    // id is needed for each operation in the transation.
+    txId = ramcloud->rpcTracker->newRpcIdBlock(this, commitCache.size() + 1);
 
     nextCacheEntry = commitCache.begin();
     uint64_t i = 0;
@@ -245,7 +219,7 @@ ClientTransactionTask::initTask()
         const CacheKey* key = &nextCacheEntry->first;
         CacheEntry* entry = &nextCacheEntry->second;
 
-        entry->rpcId = txId + i++;
+        entry->rpcId = txId + (++i);
         participantList.emplaceAppend<WireFormat::TxParticipant>(
                 key->tableId,
                 static_cast<uint64_t>(key->keyHash),
@@ -259,15 +233,10 @@ ClientTransactionTask::initTask()
 /**
  * Process any decision rpcs that have completed.  Used in performTask.
  * Factored out mostly for clarity and ease of testing.
- * \return
- *      0 means the method did some useful work; 0 means there was no
- *      work to do.
  */
-int
+void
 ClientTransactionTask::processDecisionRpcResults()
 {
-    int foundWork = 0;
-
     // Process outstanding RPCs.
     std::list<DecisionRpc>::iterator it = decisionRpcs.begin();
     for (; it != decisionRpcs.end(); it++) {
@@ -276,38 +245,35 @@ ClientTransactionTask::processDecisionRpcResults()
         if (!rpc->isReady()) {
             continue;
         }
-        foundWork = 1;
 
-        if (rpc->getState() == RpcWrapper::RpcState::FAILED) {
-            // Nothing to do.  Retry has already been arranged.
-            TEST_LOG("FAILED");
-        } else if (rpc->responseHeader->status == STATUS_OK) {
+        try {
+            rpc->wait();
+            // At this point the decision must have been received successfully.
+            // Nothing left to do.
             TEST_LOG("STATUS_OK");
-        } else if (rpc->responseHeader->status == STATUS_UNKNOWN_TABLET) {
-            // Nothing to do.  Will be retried.
+        } catch (UnknownTabletException& e) {
+            // Target server did not contain the requested tablet; the
+            // operations should have been already marked for retry. Nothing
+            // left to do.
             TEST_LOG("STATUS_UNKNOWN_TABLET");
-        } else {
-            ClientException::throwException(HERE, rpc->responseHeader->status);
+        } catch (ServerNotUpException& e) {
+            // If the target server is not up; the operations should have been
+            // already marked for retry.  Nothing left to do.
+            TEST_LOG("STATUS_SERVER_NOT_UP");
         }
 
         // Destroy object.
         it = decisionRpcs.erase(it);
     }
-    return foundWork;
 }
 
 /**
  * Process any prepare rpcs that have completed.  Used in performTask.  Factored
  * out mostly for clarity and ease of testing.
- * \return
- *      0 means the method did some useful work; 0 means there was no
- *      work to do.
  */
-int
+void
 ClientTransactionTask::processPrepareRpcResults()
 {
-    int foundWork = 0;
-
     // Process outstanding RPCs.
     std::list<PrepareRpc>::iterator it = prepareRpcs.begin();
     for (; it != prepareRpcs.end(); it++) {
@@ -316,42 +282,66 @@ ClientTransactionTask::processPrepareRpcResults()
         if (!rpc->isReady()) {
             continue;
         }
-        foundWork = 1;
 
-        if (rpc->getState() == RpcWrapper::RpcState::FAILED) {
-            // Nothing to do.  Retry has already been arranged.
-            TEST_LOG("FAILED");
-        } else if (rpc->responseHeader->status == STATUS_OK) {
-            WireFormat::TxPrepare::Response* respHdr =
-                    rpc->response->getStart<WireFormat::TxPrepare::Response>();
-            if (respHdr->vote == WireFormat::TxPrepare::ABORT) {
-                decision = WireFormat::TxDecision::ABORT;
+        try {
+            WireFormat::TxPrepare::Vote newVote = rpc->wait();
+            if (newVote == WireFormat::TxPrepare::PREPARED) {
+                // Wait for other prepare requests to complete; nothing to do.
+                TEST_LOG("PREPARED");
+            } else if (newVote == WireFormat::TxPrepare::ABORT) {
+                // Decide the transaction should ABORT (as long as the
+                // transaction has not already committed).
+                if (expect_true(decision != WireFormat::TxDecision::COMMIT)) {
+                    decision = WireFormat::TxDecision::ABORT;
+                } else {
+                    // Possible Byzantine failure detected; do not continue.
+                    RAMCLOUD_LOG(ERROR,
+                            "TxPrepare trying to ABORT after COMMITTED.");
+                    ClientException::throwException(HERE,
+                                                    STATUS_INTERNAL_ERROR);
+                }
+            } else if (newVote == WireFormat::TxPrepare::COMMITTED) {
+                // Note the transaction has COMMITTED (as long as the
+                // transaction did not previously decided to abort).
+                if (expect_true(decision != WireFormat::TxDecision::ABORT)) {
+                    decision = WireFormat::TxDecision::COMMIT;
+                } else {
+                    // Possible Byzantine failure detected; do not continue.
+                    RAMCLOUD_LOG(ERROR,
+                            "TxPrepare claims COMMITTED after ABORT received.");
+                    ClientException::throwException(HERE,
+                                                    STATUS_INTERNAL_ERROR);
+                }
+            } else {
+                // Possible Byzantine failure detected; do not continue.
+                RAMCLOUD_LOG(ERROR, "TxPrepare returned unexpected result.");
+                ClientException::throwException(HERE,
+                                                STATUS_INTERNAL_ERROR);
             }
-        } else if (rpc->responseHeader->status == STATUS_UNKNOWN_TABLET) {
-            // Nothing to do.  Will be retried.
+        } catch (UnknownTabletException& e) {
+            // Target server did not contain the requested tablet; the
+            // operations should have been already marked for retry. Nothing
+            // left to do.
             TEST_LOG("STATUS_UNKNOWN_TABLET");
-        } else {
-            ClientException::throwException(HERE, rpc->responseHeader->status);
+        } catch (ServerNotUpException& e) {
+            // If the target server is not up; the operations should have been
+            // already marked for retry.  Nothing left to do.
+            TEST_LOG("STATUS_SERVER_NOT_UP");
         }
 
         // Destroy object.
         it = prepareRpcs.erase(it);
     }
-    return foundWork;
 }
 
 /**
  * Send out a batch of un-sent decision notifications as a single DecisionRpc
  * if not all masters have been notified.  Used in performTask.  Factored out
  * mostly for clarity and ease of testing.
- * \return
- *      0 means the method did some useful work; 0 means there was no
- *      work to do.
  */
-int
+void
 ClientTransactionTask::sendDecisionRpc()
 {
-    int foundWork = 0;
     DecisionRpc* nextRpc = NULL;
     Transport::SessionRef rpcSession;
     for (; nextCacheEntry != commitCache.end(); nextCacheEntry++) {
@@ -366,7 +356,6 @@ ClientTransactionTask::sendDecisionRpc()
         if (entry->state == CacheEntry::DECIDE) {
             continue;
         }
-        foundWork = 1;
 
         // Batch is done naively assuming that tables are partitioned across
         // servers into contiguous key-hash ranges (tablets).  The commit cache
@@ -377,40 +366,33 @@ ClientTransactionTask::sendDecisionRpc()
         // resulting in poor batching.
         if (nextRpc == NULL) {
             rpcSession =
-                    ramcloud->objectFinder.lookup(key->tableId,
-                                                  key->keyHash);
+                    ramcloud->clientContext->objectFinder->lookup(key->tableId,
+                                                                  key->keyHash);
             decisionRpcs.emplace_back(ramcloud, rpcSession, this);
             nextRpc = &decisionRpcs.back();
         }
 
         Transport::SessionRef session =
-                ramcloud->objectFinder.lookup(key->tableId, key->keyHash);
-        if (session->getServiceLocator() == rpcSession->getServiceLocator()
-            && nextRpc->reqHdr->participantCount <
-                    DecisionRpc::MAX_OBJECTS_PER_RPC) {
-            nextRpc->appendOp(nextCacheEntry);
-        } else {
+                ramcloud->clientContext->objectFinder->lookup(key->tableId,
+                                                              key->keyHash);
+        if (session->getServiceLocator() != rpcSession->getServiceLocator()
+                || !nextRpc->appendOp(nextCacheEntry)) {
             break;
         }
     }
     if (nextRpc) {
         nextRpc->send();
     }
-    return foundWork;
 }
 
 /**
  * Send out a batch of un-sent prepare requests in a single PrepareRpc if there
  * are remaining un-prepared transaction ops.  Used in performTask.  Factored
  * out mostly for clarity and ease of testing.
- * \return
- *      0 means the method did some useful work; 0 means there was no
- *      work to do.
  */
-int
+void
 ClientTransactionTask::sendPrepareRpc()
 {
-    int foundWork = 0;
     PrepareRpc* nextRpc = NULL;
     Transport::SessionRef rpcSession;
     for (; nextCacheEntry != commitCache.end(); nextCacheEntry++) {
@@ -425,7 +407,6 @@ ClientTransactionTask::sendPrepareRpc()
         if (entry->state == CacheEntry::PREPARE) {
             continue;
         }
-        foundWork = 1;
 
         // Batch is done naively assuming that tables are partitioned across
         // servers into contiguous key-hash ranges (tablets).  The commit cache
@@ -436,42 +417,100 @@ ClientTransactionTask::sendPrepareRpc()
         // resulting in poor batching.
         if (nextRpc == NULL) {
             rpcSession =
-                    ramcloud->objectFinder.lookup(key->tableId,
-                                                  key->keyHash);
+                    ramcloud->clientContext->objectFinder->lookup(key->tableId,
+                                                                  key->keyHash);
             prepareRpcs.emplace_back(ramcloud, rpcSession, this);
             nextRpc = &prepareRpcs.back();
         }
 
         Transport::SessionRef session =
-                ramcloud->objectFinder.lookup(key->tableId, key->keyHash);
-        if (session->getServiceLocator() == rpcSession->getServiceLocator()
-            && nextRpc->reqHdr->opCount < PrepareRpc::MAX_OBJECTS_PER_RPC) {
-            nextRpc->appendOp(nextCacheEntry);
-        } else {
+                ramcloud->clientContext->objectFinder->lookup(key->tableId,
+                                                              key->keyHash);
+        if (session->getServiceLocator() != rpcSession->getServiceLocator()
+                || !nextRpc->appendOp(nextCacheEntry)) {
             break;
         }
     }
     if (nextRpc) {
         nextRpc->send();
     }
-    return foundWork;
 }
 
 // See RpcTracker::TrackedRpc for documentation.
 void ClientTransactionTask::tryFinish()
 {
     // Making forward progress requires the follow:
-    //  (1) Calling performTask
+    //  (1) Calling performTask (by calling poll on the manager)
     //  (2) Allowing the transport to run by calling poll
-    // This method would only be called if this task is active.  Since active
-    // tasks are driven by their ClientTransactionTask::Poller (i.e. the poller
-    // calls performTask if the tasks is active) and the poller runs in the poll
-    // loop, it is sufficient to simply call poll.
+    ramcloud->transactionManager->poll();
     ramcloud->poll();
 }
 
 /**
- * Constructor for a decision rpc.
+ * Constructor for ClientTransactionRpcWrapper.
+ *
+ * \param ramcloud
+ *      The RAMCloud object that governs this RPC.
+ * \param session
+ *      Session on which this RPC will eventually be sent.
+ * \param task
+ *      Pointer to the transaction task that issued this request.
+ * \param responseHeaderLength
+ *      The size of header expected in the response for this RPC;
+ *      incoming responses will be checked by this class to ensure that
+ *      they contain at least this much data, wrapper subclasses can
+ *      use the getResponseHeader method to access the response header
+ *      once isReady has returned true.
+ */
+ClientTransactionTask::ClientTransactionRpcWrapper::ClientTransactionRpcWrapper(
+        RamCloud* ramcloud,
+        Transport::SessionRef session,
+        ClientTransactionTask* task,
+        uint32_t responseHeaderLength)
+    : RpcWrapper(responseHeaderLength)
+    , ramcloud(ramcloud)
+    , task(task)
+    , ops()
+{
+    this->session = session;
+}
+
+// See RpcWrapper for documentation.
+bool
+ClientTransactionTask::ClientTransactionRpcWrapper::checkStatus()
+{
+    if (responseHeader->status == STATUS_UNKNOWN_TABLET) {
+        markOpsForRetry();
+    }
+    return true;
+}
+
+// See RpcWrapper for documentation.
+bool
+ClientTransactionTask::ClientTransactionRpcWrapper::handleTransportError()
+{
+    // There was a transport-level failure. Flush cached state related
+    // to this session, and related to the object mappings.  The objects
+    // will all be retried when \c finish is called.
+    if (session.get() != NULL) {
+        ramcloud->clientContext->transportManager->flushSession(
+                session->getServiceLocator());
+        session = NULL;
+    }
+    markOpsForRetry();
+    return true;
+}
+
+// See RpcWrapper for documentation.
+void
+ClientTransactionTask::ClientTransactionRpcWrapper::send()
+{
+    state = IN_PROGRESS;
+    session->sendRequest(&request, response, this);
+}
+
+/**
+ * Constructor for a DecisionRpc.
  *
  * \param ramcloud
  *      The RAMCloud object that governs this RPC.
@@ -483,50 +522,15 @@ void ClientTransactionTask::tryFinish()
 ClientTransactionTask::DecisionRpc::DecisionRpc(RamCloud* ramcloud,
         Transport::SessionRef session,
         ClientTransactionTask* task)
-    : RpcWrapper(sizeof(WireFormat::TxDecision::Response))
-    , ramcloud(ramcloud)
-    , task(task)
-    , ops()
+    : ClientTransactionRpcWrapper(ramcloud,
+                                  session,
+                                  task,
+                                  sizeof(WireFormat::TxDecision::Response))
     , reqHdr(allocHeader<WireFormat::TxDecision>())
 {
     reqHdr->decision = task->decision;
     reqHdr->leaseId = task->lease.leaseId;
     reqHdr->participantCount = 0;
-    this->session = session;
-}
-
-// See RpcWrapper for documentation.
-bool
-ClientTransactionTask::DecisionRpc::checkStatus()
-{
-    if (responseHeader->status == STATUS_UNKNOWN_TABLET) {
-        retryRequest();
-    }
-    return true;
-}
-
-// See RpcWrapper for documentation.
-bool
-ClientTransactionTask::DecisionRpc::handleTransportError()
-{
-    // There was a transport-level failure. Flush cached state related
-    // to this session, and related to the object mappings.  The objects
-    // will all be retried when \c finish is called.
-    if (session.get() != NULL) {
-        ramcloud->clientContext->transportManager->flushSession(
-                session->getServiceLocator());
-        session = NULL;
-    }
-    retryRequest();
-    return true;
-}
-
-// See RpcWrapper for documentation.
-void
-ClientTransactionTask::DecisionRpc::send()
-{
-    state = IN_PROGRESS;
-    session->sendRequest(&request, response, this);
 }
 
 /**
@@ -534,10 +538,16 @@ ClientTransactionTask::DecisionRpc::send()
  *
  * \param opEntry
  *      Handle to information about the operation to be appended.
+ * \return
+ *      True if the op was successfully appended; false otherwise.
  */
-void
+bool
 ClientTransactionTask::DecisionRpc::appendOp(CommitCacheMap::iterator opEntry)
 {
+    if (reqHdr->participantCount >= DecisionRpc::MAX_OBJECTS_PER_RPC) {
+        return false;
+    }
+
     const CacheKey* key = &opEntry->first;
     CacheEntry* entry = &opEntry->second;
 
@@ -549,20 +559,47 @@ ClientTransactionTask::DecisionRpc::appendOp(CommitCacheMap::iterator opEntry)
     entry->state = CacheEntry::DECIDE;
     ops[reqHdr->participantCount] = opEntry;
     reqHdr->participantCount++;
+    return true;
 }
 
 /**
- * This method is invoked when a prepare RPC couldn't complete successfully. It
+ * Wait for the Decision RPC to be acknowledged.
+ *
+ * \throw ServerNotUpException
+ *      The intended server for this RPC is not part of the cluster; if it ever
+ *      existed, it has since crashed.  Operations have been marked for retry;
+ *      caller can and should discard this RPC.
+ * \throw UnknownTabletException
+ *      The target server is not the owner of one or more of the included
+ *      operations.  This could have occurred due to an out of date tablet map.
+ *      Operations have been marked for retry; caller can and should discard
+ *      this RPC.
+ */
+void
+ClientTransactionTask::DecisionRpc::wait()
+{
+    waitInternal(ramcloud->clientContext->dispatch);
+
+    if (getState() == FAILED) {
+        // Target server was not reachable. Retry has already been arranged.
+        throw ServerNotUpException(HERE);
+    } else if (responseHeader->status != STATUS_OK) {
+        ClientException::throwException(HERE, responseHeader->status);
+    }
+}
+
+/**
+ * This method is invoked when a decision RPC couldn't complete successfully. It
  * arranges for prepares to be tried again for all of the participant objects in
  * that request.
  */
 void
-ClientTransactionTask::DecisionRpc::retryRequest()
+ClientTransactionTask::DecisionRpc::markOpsForRetry()
 {
     for (uint32_t i = 0; i < reqHdr->participantCount; i++) {
         const CacheKey* key = &ops[i]->first;
         CacheEntry* entry = &ops[i]->second;
-        ramcloud->objectFinder.flush(key->tableId);
+        ramcloud->clientContext->objectFinder->flush(key->tableId);
         entry->state = CacheEntry::PENDING;
     }
     task->nextCacheEntry = task->commitCache.begin();
@@ -580,52 +617,18 @@ ClientTransactionTask::DecisionRpc::retryRequest()
  */
 ClientTransactionTask::PrepareRpc::PrepareRpc(RamCloud* ramcloud,
         Transport::SessionRef session, ClientTransactionTask* task)
-    : RpcWrapper(sizeof(WireFormat::TxPrepare::Response))
-    , ramcloud(ramcloud)
-    , task(task)
-    , ops()
+    : ClientTransactionRpcWrapper(ramcloud,
+                                  session,
+                                  task,
+                                  sizeof(WireFormat::TxDecision::Response))
     , reqHdr(allocHeader<WireFormat::TxPrepare>())
 {
     reqHdr->lease = task->lease;
+    reqHdr->clientTxId = task->txId;
+    reqHdr->ackId = ramcloud->rpcTracker->ackId();
     reqHdr->participantCount = task->participantCount;
     reqHdr->opCount = 0;
     request.appendExternal(&task->participantList);
-    this->session = session;
-}
-
-// See RpcWrapper for documentation.
-bool
-ClientTransactionTask::PrepareRpc::checkStatus()
-{
-    if (responseHeader->status == STATUS_UNKNOWN_TABLET) {
-        retryRequest();
-    }
-    return true;
-}
-
-// See RpcWrapper for documentation.
-bool
-ClientTransactionTask::PrepareRpc::handleTransportError()
-{
-    // There was a transport-level failure. Flush cached state related
-    // to this session, and related to the object mappings.  The objects
-    // will all be retried when \c finish is called.
-    if (session.get() != NULL) {
-        ramcloud->clientContext->transportManager->flushSession(
-                session->getServiceLocator());
-        session = NULL;
-    }
-    retryRequest();
-    return true;
-}
-
-// See RpcWrapper for documentation.
-void
-ClientTransactionTask::PrepareRpc::send()
-{
-    reqHdr->ackId = ramcloud->rpcTracker.ackId();
-    state = IN_PROGRESS;
-    session->sendRequest(&request, response, this);
 }
 
 /**
@@ -633,10 +636,16 @@ ClientTransactionTask::PrepareRpc::send()
  *
  * \param opEntry
  *      Handle to information about the operation to be appended.
+ * \return
+ *      True if the op was successfully appended; false otherwise.
  */
-void
+bool
 ClientTransactionTask::PrepareRpc::appendOp(CommitCacheMap::iterator opEntry)
 {
+    if (reqHdr->opCount >= PrepareRpc::MAX_OBJECTS_PER_RPC) {
+        return false;
+    }
+
     const CacheKey* key = &opEntry->first;
     CacheEntry* entry = &opEntry->second;
 
@@ -644,7 +653,8 @@ ClientTransactionTask::PrepareRpc::appendOp(CommitCacheMap::iterator opEntry)
         case CacheEntry::READ:
             request.emplaceAppend<WireFormat::TxPrepare::Request::ReadOp>(
                     key->tableId, entry->rpcId,
-                    entry->objectBuf->getKeyLength(), entry->rejectRules);
+                    entry->objectBuf->getKeyLength(), entry->rejectRules,
+                    task->readOnly);
             request.appendExternal(entry->objectBuf->getKey(),
                     entry->objectBuf->getKeyLength());
             break;
@@ -663,12 +673,48 @@ ClientTransactionTask::PrepareRpc::appendOp(CommitCacheMap::iterator opEntry)
             break;
         default:
             RAMCLOUD_LOG(ERROR, "Unknown transaction op type.");
-            return;
+            return false;
     }
 
     entry->state = CacheEntry::PREPARE;
     ops[reqHdr->opCount] = opEntry;
     reqHdr->opCount++;
+    return true;
+}
+
+/**
+ * Wait for the Prepare request to complete, and return participant servers
+ * vote to either proceed or abort.
+ *
+ * \return
+ *      The participant server's response to the request to prepare the included
+ *      transaction operations for commit.  See WireFormat::TxPrepare::Vote for
+ *      documentation of possible responses.
+ * \throw ServerNotUpException
+ *      The intended server for this RPC is not part of the cluster; if it ever
+ *      existed, it has since crashed.  Operations have been marked for retry;
+ *      caller can and should discard this RPC.
+ * \throw UnknownTabletException
+ *      The target server is not the owner of one or more of the included
+ *      operations.  This could have occurred due to an out of date tablet map.
+ *      Operations have been marked for retry; caller can and should discard
+ *      this RPC.
+ */
+WireFormat::TxPrepare::Vote
+ClientTransactionTask::PrepareRpc::wait()
+{
+    waitInternal(ramcloud->clientContext->dispatch);
+
+    if (getState() == FAILED) {
+        // Target server was not reachable. Retry has already been arranged.
+        throw ServerNotUpException(HERE);
+    } else if (responseHeader->status != STATUS_OK) {
+        ClientException::throwException(HERE, responseHeader->status);
+    }
+
+    WireFormat::TxPrepare::Response* respHdr =
+            response->getStart<WireFormat::TxPrepare::Response>();
+    return respHdr->vote;
 }
 
 /**
@@ -677,12 +723,12 @@ ClientTransactionTask::PrepareRpc::appendOp(CommitCacheMap::iterator opEntry)
  * that request.
  */
 void
-ClientTransactionTask::PrepareRpc::retryRequest()
+ClientTransactionTask::PrepareRpc::markOpsForRetry()
 {
     for (uint32_t i = 0; i < reqHdr->opCount; i++) {
         const CacheKey* key = &ops[i]->first;
         CacheEntry* entry = &ops[i]->second;
-        ramcloud->objectFinder.flush(key->tableId);
+        ramcloud->clientContext->objectFinder->flush(key->tableId);
         entry->state = CacheEntry::PENDING;
     }
     task->nextCacheEntry = task->commitCache.begin();

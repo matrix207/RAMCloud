@@ -13,7 +13,10 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
+#include "Context.h"
+#include "Dispatch.h"
 #include "IndexLookup.h"
+#include "ObjectFinder.h"
 
 namespace RAMCloud {
 
@@ -186,7 +189,7 @@ IndexLookup::isReady()
         // required by both rules 5 and 6.
         KeyHash pKHash = activeHashes[numAssigned & ARRAY_MASK];
         Transport::SessionRef session =
-            ramcloud->objectFinder.lookup(tableId, pKHash);
+            ramcloud->clientContext->objectFinder->lookup(tableId, pKHash);
 
         // Rule 5:
         // Try to assign the current key hash to an existing RPC corresponding
@@ -257,7 +260,7 @@ IndexLookup::isReady()
             readRpcs[i].status = RESULT_READY;
             // Update objectFinder if no pKHashes got processed in a readRpc.
             if (numProcessedPKHashes == 0)
-                ramcloud->objectFinder.flush(tableId);
+                ramcloud->clientContext->objectFinder->flush(tableId);
             if (numProcessedPKHashes < readRpcs[i].numHashes) {
                 for (size_t p = numRemoved; p < numInserted; p ++) {
                     // Some of the key hashes couldn't be looked up in this
@@ -375,6 +378,7 @@ IndexLookup::getNext()
 
         Buffer& curBuff = readRpcs[curIdx].resp;
         uint32_t& curOffset = readRpcs[curIdx].offset;
+        uint32_t origOffset = curOffset;
 
         uint64_t version = *curBuff.getOffset<uint64_t>(curOffset);
         curOffset += sizeof32(uint64_t);
@@ -386,11 +390,28 @@ IndexLookup::getNext()
         curOffset += length;
 
         if (curObj->getPKHash() != activeHashes[numRemoved & ARRAY_MASK]) {
-            numRemoved++;
+            // If the PKHash does not match, then that should mean that
+            // this output is meant for a later pKHash. Here, we "assert" that
+            #if DEBUG_BUILD
+                bool found = false;
+                size_t end = (numAssigned & ARRAY_MASK);
+                for (size_t i = numRemoved; (i & ARRAY_MASK) != end; ++i) {
+                    if (activeHashes[i] == curObj->getPKHash()) {
+                        found = true;
+                        break;
+                    }
+                }
+
+                assert(found);
+            #endif
+
+            haveObjectToReturn = false;
+            curOffset = origOffset; // Rollback for future consumption.
+        } else {
+           haveObjectToReturn = IndexKey::isKeyInRange(curObj.get(), &keyRange);
         }
 
-        haveObjectToReturn = IndexKey::isKeyInRange(curObj.get(), &keyRange);
-
+        numRemoved++;
     } while (!haveObjectToReturn);
 
     return true;

@@ -13,9 +13,11 @@
  * CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
+#include "ClientLeaseAgent.h"
 #include "Logger.h"
 #include "LinearizableObjectRpcWrapper.h"
 #include "RamCloud.h"
+#include "RpcTracker.h"
 
 namespace RAMCloud {
 
@@ -48,9 +50,10 @@ LinearizableObjectRpcWrapper::LinearizableObjectRpcWrapper(
         RamCloud* ramcloud, bool linearizable, uint64_t tableId,
         const void* key, uint16_t keyLength, uint32_t responseHeaderLength,
         Buffer* response)
-    : ObjectRpcWrapper(ramcloud, tableId, key, keyLength,
+    : ObjectRpcWrapper(ramcloud->clientContext, tableId, key, keyLength,
                        responseHeaderLength, response)
     , linearizabilityOn(linearizable)
+    , ramcloud(ramcloud)
     , assignedRpcId(0)
 {
 }
@@ -80,9 +83,10 @@ LinearizableObjectRpcWrapper::LinearizableObjectRpcWrapper(
 LinearizableObjectRpcWrapper::LinearizableObjectRpcWrapper(
         RamCloud* ramcloud, bool linearizable, uint64_t tableId,
         uint64_t keyHash, uint32_t responseHeaderLength, Buffer* response)
-    : ObjectRpcWrapper(ramcloud, tableId, keyHash,
+    : ObjectRpcWrapper(ramcloud->clientContext, tableId, keyHash,
                        responseHeaderLength, response)
     , linearizabilityOn(linearizable)
+    , ramcloud(ramcloud)
     , assignedRpcId(0)
 {
 }
@@ -93,7 +97,7 @@ LinearizableObjectRpcWrapper::LinearizableObjectRpcWrapper(
 LinearizableObjectRpcWrapper::~LinearizableObjectRpcWrapper()
 {
     if (linearizabilityOn && assignedRpcId) {
-        ramcloud->rpcTracker.rpcFinished(assignedRpcId);
+        ramcloud->rpcTracker->rpcFinished(assignedRpcId);
         assignedRpcId = 0;
     }
 }
@@ -108,9 +112,26 @@ LinearizableObjectRpcWrapper::cancel()
 {
     RpcWrapper::cancel();
     if (linearizabilityOn && assignedRpcId) {
-        ramcloud->rpcTracker.rpcFinished(assignedRpcId);
+        ramcloud->rpcTracker->rpcFinished(assignedRpcId);
         assignedRpcId = 0;
     }
+}
+
+/**
+ * Indicates whether a response has been received for an RPC.  Used for
+ * asynchronous processing of RPCs.  Calling this method will also ensure
+ * the ClientLease remains valid.
+ *
+ * \return
+ *      True means that the RPC has finished or been canceled; #wait will
+ *      not block.  False means that the RPC is still being processed.
+ */
+bool
+LinearizableObjectRpcWrapper::isReady()
+{
+    // Poke the client lease to keep it valid.
+    ramcloud->clientLeaseAgent->poll();
+    return RpcWrapper::isReady();
 }
 
 /**
@@ -125,11 +146,11 @@ void
 LinearizableObjectRpcWrapper::fillLinearizabilityHeader(RpcRequest* reqHdr)
 {
     if (linearizabilityOn) {
-        assignedRpcId = ramcloud->rpcTracker.newRpcId(this);
+        assignedRpcId = ramcloud->rpcTracker->newRpcId(this);
         assert(assignedRpcId);
-        reqHdr->lease = ramcloud->clientLease.getLease();
+        reqHdr->lease = ramcloud->clientLeaseAgent->getLease();
         reqHdr->rpcId = assignedRpcId;
-        reqHdr->ackId = ramcloud->rpcTracker.ackId();
+        reqHdr->ackId = ramcloud->rpcTracker->ackId();
     } else {
         reqHdr->rpcId = 0; // rpcId starts from 1. 0 means non-linearizable
         reqHdr->ackId = 0;
@@ -171,7 +192,7 @@ LinearizableObjectRpcWrapper::waitInternal(Dispatch* dispatch,
     assert(state == FINISHED || state == CANCELED);
 #endif
 
-    ramcloud->rpcTracker.rpcFinished(assignedRpcId);
+    ramcloud->rpcTracker->rpcFinished(assignedRpcId);
     assignedRpcId = 0;
     return true;
     }
@@ -186,10 +207,14 @@ void LinearizableObjectRpcWrapper::tryFinish()
 
 /*
  * Following line is necessary to tell compiler to instantiate the templatized
- * method "fillLinearizabilityHeader" with WireFormat::Write::Request.
+ * method "fillLinearizabilityHeader" with WireFormat::Write::Request, etc.
  * This manual instantiation is necessary if the method is defined in cc file.
  */
 template void LinearizableObjectRpcWrapper::fillLinearizabilityHeader
     <WireFormat::Write::Request>(WireFormat::Write::Request* reqHdr);
+template void LinearizableObjectRpcWrapper::fillLinearizabilityHeader
+    <WireFormat::Increment::Request>(WireFormat::Increment::Request* reqHdr);
+template void LinearizableObjectRpcWrapper::fillLinearizabilityHeader
+    <WireFormat::Remove::Request>(WireFormat::Remove::Request* reqHdr);
 
 } // namespace RAMCloud

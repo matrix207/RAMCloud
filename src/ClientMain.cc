@@ -1,4 +1,4 @@
-/* Copyright (c) 2009-2014 Stanford University
+/* Copyright (c) 2009-2015 Stanford University
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -19,7 +19,9 @@
 #include <assert.h>
 
 #include "ClusterMetrics.h"
+#include "Context.h"
 #include "Cycles.h"
+#include "Dispatch.h"
 #include "ShortMacros.h"
 #include "Crc32C.h"
 #include "ObjectFinder.h"
@@ -39,7 +41,7 @@ bool fillWithTestData = false;
  * This method is used for testing coordinator crash recovery. It is
  * normally invoked repeatedly. Each invocation runs a set of representative
  * cluster operations, with some consistency checks mixed in.
- * 
+ *
  * \param client
  *      Connection to the RAMCloud cluster.
  */
@@ -199,7 +201,7 @@ void indexCrash(RamCloud* client)
     keys[2].keyLength = 10;
     uint64_t newVersion;
     client->write(tableId, 3, keys, "This is a test value", 20, NULL,
-            &newVersion, false, false);
+            &newVersion, false);
     LOG(NOTICE, "Wrote value into table");
 
     if (!lookupAndLog(client, tableId, "Object value after writing")) {
@@ -310,7 +312,6 @@ try
         exit(0);
     }
 
-    return 0;
     b = Cycles::rdtsc();
     client.createTable("test");
     uint64_t table;

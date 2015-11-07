@@ -20,6 +20,7 @@
 #include <map>
 #include <memory>
 
+#include "Dispatch.h"
 #include "RamCloud.h"
 
 namespace RAMCloud {
@@ -102,6 +103,9 @@ class ClientTransactionTask : public RpcTracker::TrackedRpc {
     };
 
     explicit ClientTransactionTask(RamCloud* ramcloud);
+    ~ClientTransactionTask() {
+        RAMCLOUD_TEST_LOG("Destructor called.");
+    }
 
     CacheEntry* findCacheEntry(Key& key);
     /// Return the transaction commit decision if a decision has been reached.
@@ -115,8 +119,7 @@ class ClientTransactionTask : public RpcTracker::TrackedRpc {
         return (state == DONE ||
                 (state == DECISION && nextCacheEntry == commitCache.end()));
     }
-    int performTask();
-    static void start(std::shared_ptr<ClientTransactionTask>& taskPtr);
+    void performTask();
 
   PRIVATE:
     // Forward declaration of RPCs
@@ -126,6 +129,12 @@ class ClientTransactionTask : public RpcTracker::TrackedRpc {
     /// Overall client state information.
     RamCloud* ramcloud;
 
+  PUBLIC:
+    /// Flag that can be set indicating that the transaction is read-only and
+    /// the read-only optimization can be used.
+    bool readOnly;
+
+  PRIVATE:
     /// Number of participant objects/operations.
     uint32_t participantCount;
     /// Expandable raw storage for the List of participant object identifiers.
@@ -144,8 +153,8 @@ class ClientTransactionTask : public RpcTracker::TrackedRpc {
     /// Lease information for to this transaction.
     WireFormat::ClientLease lease;
 
-    /// Id of the rpcId that should be completed once the transaction is
-    /// complete.
+    /// RpcId used to identify this transaction.  Also is the rpcId that should
+    /// be completed once the transaction is complete.
     uint64_t txId;
 
     /// List of "in flight" Prepare Rpcs.
@@ -184,49 +193,28 @@ class ClientTransactionTask : public RpcTracker::TrackedRpc {
     /// commit protocol.
     CommitCacheMap::iterator nextCacheEntry;
 
-    /**
-     * The Poller drives the execution of the ClientTransactionTask.  While this
-     * object exists, ClientTransactionTask::performTask will be called.
-     */
-    class Poller : public Dispatch::Poller {
-      PUBLIC:
-        explicit Poller(Dispatch* dispatch,
-                        std::shared_ptr<ClientTransactionTask>& taskPtr);
-        virtual int poll();
-
-      PRIVATE:
-        /// Keeps track of if the poll method is already executing to prevent
-        /// recursive calls due to the use of polling in other modules.
-        bool running;
-        /// Shared pointer to the ClientTransactionTask to be run.
-        std::shared_ptr<ClientTransactionTask> taskPtr;
-
-        DISALLOW_COPY_AND_ASSIGN(Poller);
-    };
-    /// Used to delay execution of the task until commit time.
-    Tub<Poller> poller;
-
     void initTask();
-    int processDecisionRpcResults();
-    int processPrepareRpcResults();
-    int sendDecisionRpc();
-    int sendPrepareRpc();
+    void processDecisionRpcResults();
+    void processPrepareRpcResults();
+    void sendDecisionRpc();
+    void sendPrepareRpc();
     virtual void tryFinish();
 
-    /// Encapsulates the state of a single Decision RPC sent to a single server.
-    class DecisionRpc : public RpcWrapper {
-        friend class ClientTransactionTask;
-      public:
-        DecisionRpc(RamCloud* ramcloud, Transport::SessionRef session,
-                    ClientTransactionTask* task);
-        ~DecisionRpc() {}
-
-        bool checkStatus();
-        bool handleTransportError();
+    /// Encapsulates common state and methods of Decision and Prepare RPCs.
+    class ClientTransactionRpcWrapper : public RpcWrapper {
+      PUBLIC:
+        ClientTransactionRpcWrapper(RamCloud* ramcloud,
+                Transport::SessionRef session,
+                ClientTransactionTask* task,
+                uint32_t responseHeaderLength);
+        ~ClientTransactionRpcWrapper() {}
+        virtual bool appendOp(CommitCacheMap::iterator opEntry) = 0;
         void send();
 
-        void appendOp(CommitCacheMap::iterator opEntry);
-        void retryRequest();
+      PROTECTED:
+        bool checkStatus();
+        bool handleTransportError();
+        virtual void markOpsForRetry() = 0;
 
         /// Overall client state information.
         RamCloud* ramcloud;
@@ -243,6 +231,21 @@ class ClientTransactionTask : public RpcTracker::TrackedRpc {
 #endif
         CommitCacheMap::iterator ops[MAX_OBJECTS_PER_RPC];
 
+        DISALLOW_COPY_AND_ASSIGN(ClientTransactionRpcWrapper);
+    };
+
+    /// Encapsulates the state of a single Decision RPC sent to a single server.
+    class DecisionRpc : public ClientTransactionRpcWrapper {
+      PUBLIC:
+        DecisionRpc(RamCloud* ramcloud, Transport::SessionRef session,
+                    ClientTransactionTask* task);
+        ~DecisionRpc() {}
+        bool appendOp(CommitCacheMap::iterator opEntry);
+        void wait();
+
+      PROTECTED:
+        void markOpsForRetry();
+
         /// Header for the RPC (used to update count as objects are added).
         WireFormat::TxDecision::Request* reqHdr;
 
@@ -250,34 +253,16 @@ class ClientTransactionTask : public RpcTracker::TrackedRpc {
     };
 
     /// Encapsulates the state of a single Prepare RPC sent to a single server.
-    class PrepareRpc : public RpcWrapper {
-        friend class ClientTransactionTask;
-      public:
+    class PrepareRpc : public ClientTransactionRpcWrapper {
+      PUBLIC:
         PrepareRpc(RamCloud* ramcloud, Transport::SessionRef session,
                 ClientTransactionTask* task);
         ~PrepareRpc() {}
+        bool appendOp(CommitCacheMap::iterator opEntry);
+        WireFormat::TxPrepare::Vote wait();
 
-        bool checkStatus();
-        bool handleTransportError();
-        void send();
-
-        void appendOp(CommitCacheMap::iterator opEntry);
-        void retryRequest();
-
-        /// Overall client state information.
-        RamCloud* ramcloud;
-
-        /// ClientTransactionTask that issued this rpc.
-        ClientTransactionTask* task;
-
-        /// Reference to the CacheEntry objects whose operations are being
-        /// sent in this RPC.
-#ifdef TESTING
-        static const uint32_t MAX_OBJECTS_PER_RPC = 3;
-#else
-        static const uint32_t MAX_OBJECTS_PER_RPC = 75;
-#endif
-        CommitCacheMap::iterator ops[MAX_OBJECTS_PER_RPC];
+      PROTECTED:
+        void markOpsForRetry();
 
         /// Header for the RPC (used to update count as objects are added).
         WireFormat::TxPrepare::Request* reqHdr;

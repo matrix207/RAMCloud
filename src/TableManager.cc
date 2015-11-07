@@ -646,7 +646,7 @@ TableManager::reassignTabletOwnership(
 
     // Get current head of log to preclude all previous data in the log
     // from being considered part of this tablet.
-    Log::Position headOfLogAtCreation(ctimeSegmentId,
+    LogPosition headOfLogAtCreation(ctimeSegmentId,
                                       ctimeSegmentOffset);
     tablet->ctime = headOfLogAtCreation;
     tablet->serverId = newOwner;
@@ -687,8 +687,7 @@ TableManager::recover(uint64_t lastCompletedUpdate)
 
     // Restore overall state information.
     ProtoBuf::TableManager info;
-    if (context->externalStorage->getProtoBuf<ProtoBuf::TableManager>(
-            "tableManager", &info)) {
+    if (context->externalStorage->getProtoBuf("tableManager", &info)) {
         nextTableId = info.next_table_id();
         RAMCLOUD_LOG(NOTICE, "initializing TableManager: nextTableId = %lu",
                 nextTableId);
@@ -711,6 +710,11 @@ TableManager::recover(uint64_t lastCompletedUpdate)
                     "couldn't parse protocol buffer in /tables/%s",
                     object.name));
         }
+
+        // Update the nextTableId if this table has a higher id than
+        // any id we have encountered so far.
+        if (info.id() >= nextTableId)
+            nextTableId = info.id() + 1;
 
         // Regenerate our internal information for the table, unless the
         // table has been deleted.
@@ -944,7 +948,7 @@ TableManager::splitRecoveringTablet(uint64_t tableId, uint64_t splitKeyHash)
 void
 TableManager::tabletRecovered(
         uint64_t tableId, uint64_t startKeyHash, uint64_t endKeyHash,
-        ServerId serverId, Log::Position ctime)
+        ServerId serverId, LogPosition ctime)
 {
     Lock lock(mutex);
 
@@ -1043,7 +1047,7 @@ TableManager::createTable(const Lock& lock, const char* name,
             // using (0,0) is safe because we know this is a new table: there
             // can't be any existing information for this table stored on the
             // master.
-            Log::Position ctime(0, 0);
+            LogPosition ctime(0, 0);
             table->tablets.push_back(new Tablet(tableId, startKeyHash,
                     endKeyHash, currentTabletMaster, Tablet::NORMAL, ctime));
         }
@@ -1354,7 +1358,7 @@ TableManager::notifyDropTable(const Lock& lock, ProtoBuf::Table* info)
     // for the table (that record ensures that future coordinators know
     // about its table id).
     if (info->id() == (nextTableId-1)) {
-        sync(lock);
+        syncNextTableId(lock);
     }
 
     // Remove the table's record in external storage.
@@ -1540,12 +1544,10 @@ TableManager::recreateTable(const Lock& lock, ProtoBuf::Table* info)
     }
 
     Table* table = new Table(name.c_str(), id);
-    if (id >= nextTableId)
-        nextTableId = id + 1;
     int numTablets = info->tablet_size();
     for (int i = 0; i < numTablets; i++) {
         const ProtoBuf::Table::Tablet& tabletInfo = info->tablet(i);
-        Log::Position ctime(tabletInfo.ctime_log_head_id(),
+        LogPosition ctime(tabletInfo.ctime_log_head_id(),
                 tabletInfo.ctime_log_head_offset());
         Tablet::Status status;
         if (tabletInfo.state() == ProtoBuf::Table::Tablet::NORMAL)
@@ -1559,7 +1561,7 @@ TableManager::recreateTable(const Lock& lock, ProtoBuf::Table* info)
                 tabletInfo.end_key_hash(),
                 ServerId(tabletInfo.server_id()),
                 status,
-                Log::Position(tabletInfo.ctime_log_head_id(),
+                LogPosition(tabletInfo.ctime_log_head_id(),
                               tabletInfo.ctime_log_head_offset()));
         table->tablets.push_back(tablet);
         LOG(NOTICE, "Recovered tablet 0x%lx-0x%lx for table '%s' (id %lu) "
@@ -1611,14 +1613,13 @@ TableManager::serializeTable(const Lock& lock, Table* table,
 }
 
 /**
- * Update overall information on external storage related to this class
- * (i.e., stuff that doesn't pertain to any particular table).
+ * Update next_table_id on external storage.
  *
  * \param lock
  *      Ensures that the caller holds the monitor lock; not actually used.
  */
 void
-TableManager::sync(const Lock& lock)
+TableManager::syncNextTableId(const Lock& lock)
 {
     ProtoBuf::TableManager info;
     info.set_next_table_id(nextTableId);

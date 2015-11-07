@@ -17,12 +17,10 @@
 #define RAMCLOUD_MASTERCLIENT_H
 
 #include "Buffer.h"
-#include "Common.h"
 #include "CoordinatorClient.h"
 #include "IndexRpcWrapper.h"
 #include "Key.h"
-#include "Log.h"
-#include "Segment.h"
+#include "LogMetadata.h"
 #include "ServerId.h"
 #include "ServerIdRpcWrapper.h"
 #include "ServerStatistics.pb.h"
@@ -33,6 +31,7 @@ namespace RAMCloud {
 
 // forward declaration
 class MasterService;
+class Segment;
 
 /**
  * Provides methods for invoking RPCs to RAMCloud masters.  The invoking
@@ -49,7 +48,7 @@ class MasterClient {
             uint16_t firstNotOwnedKeyLength);
     static void dropTabletOwnership(Context* context, ServerId serverId,
             uint64_t tableId, uint64_t firstKeyHash, uint64_t lastKeyHash);
-    static Log::Position getHeadOfLog(Context* context, ServerId serverId);
+    static LogPosition getHeadOfLog(Context* context, ServerId serverId);
     static void insertIndexEntry(MasterService* master,
             uint64_t tableId, uint8_t indexId,
             const void* indexKey, KeyLength indexKeyLength,
@@ -90,6 +89,9 @@ class MasterClient {
             uint64_t tableId, uint8_t indexId, uint64_t backingTableId,
             const void *firstKey, uint16_t firstKeyLength,
             const void *firstNotOwnedKey, uint16_t firstNotOwnedKeyLength);
+    static void txHintFailed(Context* context, uint64_t tableId,
+            uint64_t keyHash, uint64_t leaseId, uint64_t clientTransactionId,
+            uint32_t participantCount, WireFormat::TxParticipant *participants);
 
   private:
     MasterClient();
@@ -137,7 +139,7 @@ class GetHeadOfLogRpc : public ServerIdRpcWrapper {
   public:
     GetHeadOfLogRpc(Context* context, ServerId serverId);
     ~GetHeadOfLogRpc() {}
-    Log::Position wait();
+    LogPosition wait();
 
   PRIVATE:
     DISALLOW_COPY_AND_ASSIGN(GetHeadOfLogRpc);
@@ -155,7 +157,7 @@ class InsertIndexEntryRpc : public IndexRpcWrapper {
             uint64_t primaryKeyHash);
     ~InsertIndexEntryRpc() {}
     void indexNotFound();
-    void wait() {simpleWait(context->dispatch);}
+    void wait() {simpleWait(context);}
 
   PRIVATE:
     DISALLOW_COPY_AND_ASSIGN(InsertIndexEntryRpc);
@@ -260,7 +262,7 @@ class RemoveIndexEntryRpc : public IndexRpcWrapper {
              uint64_t primaryKeyHash);
     ~RemoveIndexEntryRpc() {}
     void indexNotFound();
-    void wait() {simpleWait(context->dispatch);}
+    void wait() {simpleWait(context);}
 
   PRIVATE:
     DISALLOW_COPY_AND_ASSIGN(RemoveIndexEntryRpc);
@@ -333,6 +335,23 @@ class TakeIndexletOwnershipRpc : public ServerIdRpcWrapper {
 
   PRIVATE:
     DISALLOW_COPY_AND_ASSIGN(TakeIndexletOwnershipRpc);
+};
+
+/**
+ * Encapsulates the state of a MasterClient::txHintFailedRpc
+ * request, allowing it to execute asynchronously.
+ */
+class TxHintFailedRpc : public ObjectRpcWrapper {
+  public:
+    TxHintFailedRpc(Context* context, uint64_t tableId, uint64_t keyHash,
+            uint64_t leaseId, uint64_t clientTransactionId,
+            uint32_t participantCount, WireFormat::TxParticipant *participants);
+    ~TxHintFailedRpc() {}
+    /// \copydoc RpcWrapper::docForWait
+    void wait() {simpleWait(context);}
+
+  PRIVATE:
+    DISALLOW_COPY_AND_ASSIGN(TxHintFailedRpc);
 };
 
 } // namespace RAMCloud

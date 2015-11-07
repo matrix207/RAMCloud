@@ -508,6 +508,7 @@ TEST_F(TableManagerTest, recover_basics) {
     cluster.externalStorage.getChildrenValues.push(str);
 
     tableManager->recover(87);
+    EXPECT_EQ(12346U, tableManager->nextTableId);
     EXPECT_EQ("Table { name: second, id 444, "
             "Tablet { startKeyHash: 0x800, endKeyHash: 0x900, "
             "serverId: 88.0, status: RECOVERING, ctime: 31.32 } } "
@@ -929,7 +930,7 @@ TEST_F(TableManagerTest, tabletRecovered_basics) {
     cluster.externalStorage.log.clear();
 
     ServerId serverId(5, 0);
-    Log::Position ctime(10, 11);
+    LogPosition ctime(10, 11);
     tableManager->tabletRecovered(1, 0x8000000000000000, 0xffffffffffffffff,
             serverId, ctime);
     EXPECT_EQ("name: \"foo\" id: 1 "
@@ -949,7 +950,7 @@ TEST_F(TableManagerTest, tabletRecovered_noSuchTablet) {
     cluster.externalStorage.log.clear();
 
     ServerId serverId(5, 0);
-    Log::Position ctime(10, 11);
+    LogPosition ctime(10, 11);
     EXPECT_THROW(tableManager->tabletRecovered(99, 0, 0xffffffffffffffff,
             serverId, ctime), TableManager::NoSuchTablet);
     EXPECT_THROW(tableManager->tabletRecovered(1, 0, 0x7ffffffffffffffe,
@@ -987,13 +988,13 @@ TEST_F(TableManagerTest, findIndexlet) {
 TEST_F(TableManagerTest, findTablet) {
     TableManager::Table table("test", 111);
     table.tablets.push_back(new Tablet(111, 0, 0x100, ServerId(1, 0),
-            Tablet::NORMAL, Log::Position(10, 20)));
+            Tablet::NORMAL, LogPosition(10, 20)));
     table.tablets.push_back(new Tablet(111, 0x101, 0x200, ServerId(2, 0),
-            Tablet::RECOVERING, Log::Position(30, 40)));
+            Tablet::RECOVERING, LogPosition(30, 40)));
     table.tablets.push_back(new Tablet(111, 0x201, 0x300, ServerId(3, 0),
-            Tablet::NORMAL, Log::Position(50, 60)));
+            Tablet::NORMAL, LogPosition(50, 60)));
     table.tablets.push_back(new Tablet(111, 0x600, 0x700, ServerId(4, 0),
-            Tablet::NORMAL, Log::Position(70, 80)));
+            Tablet::NORMAL, LogPosition(70, 80)));
 
     Tablet* tablet;
     tablet = tableManager->findTablet(lock, &table, 0x200);
@@ -1010,13 +1011,13 @@ TEST_F(TableManagerTest, notifyCreate) {
     MasterService* master2 = cluster.addServer(masterConfig)->master.get();
     TableManager::Table table("test", 111);
     table.tablets.push_back(new Tablet(111, 0, 0x100, ServerId(1, 0),
-            Tablet::NORMAL, Log::Position(10, 20)));
+            Tablet::NORMAL, LogPosition(10, 20)));
     table.tablets.push_back(new Tablet(111, 0x200, 0x300, ServerId(2, 0),
-            Tablet::RECOVERING, Log::Position(30, 40)));
+            Tablet::RECOVERING, LogPosition(30, 40)));
     table.tablets.push_back(new Tablet(111, 0x400, 0x500, ServerId(6, 2),
-            Tablet::NORMAL, Log::Position(50, 60)));
+            Tablet::NORMAL, LogPosition(50, 60)));
     table.tablets.push_back(new Tablet(111, 0x600, 0x700, ServerId(2, 0),
-            Tablet::NORMAL, Log::Position(70, 80)));
+            Tablet::NORMAL, LogPosition(70, 80)));
 
     TestLog::Enable _("notifyCreate");
     TestLog::reset();
@@ -1199,6 +1200,7 @@ TEST_F(TableManagerTest, recreateTable_basics) {
             77, 21, 22);
     addTablet(&info, 0x800, 0x900, ProtoBuf::Table::Tablet::RECOVERING,
             88, 31, 32);
+    tableManager->nextTableId = 12346;
     tableManager->recreateTable(lock, &info);
     EXPECT_EQ("Table { name: table1, id 12345, "
             "Tablet { startKeyHash: 0x100, endKeyHash: 0x200, serverId: 66.0, "
@@ -1209,7 +1211,6 @@ TEST_F(TableManagerTest, recreateTable_basics) {
             "status: RECOVERING, ctime: 31.32 } }",
             tableManager->debugString());
     EXPECT_EQ(12345U, tableManager->directory["table1"]->id);
-    EXPECT_EQ(12346U, tableManager->nextTableId);
     EXPECT_EQ("recreateTable: Recovered tablet 0x100-0x200 for "
             "table 'table1' (id 12345) on server 66.0 | "
             "recreateTable: Recovered tablet 0x400-0x500 for "
@@ -1272,13 +1273,13 @@ TEST_F(TableManagerTest, serializeTable) {
     // Create a table with 4 tablets.
     TableManager::Table table("test", 111);
     table.tablets.push_back(new Tablet(111, 0, 0x100, ServerId(1, 0),
-            Tablet::NORMAL, Log::Position(10, 20)));
+            Tablet::NORMAL, LogPosition(10, 20)));
     table.tablets.push_back(new Tablet(111, 0x200, 0x300, ServerId(2, 0),
-            Tablet::RECOVERING, Log::Position(30, 40)));
+            Tablet::RECOVERING, LogPosition(30, 40)));
     table.tablets.push_back(new Tablet(111, 0x400, 0x500, ServerId(6, 2),
-            Tablet::NORMAL, Log::Position(50, 60)));
+            Tablet::NORMAL, LogPosition(50, 60)));
     table.tablets.push_back(new Tablet(111, 0x600, 0x700, ServerId(2, 0),
-            Tablet::NORMAL, Log::Position(70, 80)));
+            Tablet::NORMAL, LogPosition(70, 80)));
 
     ProtoBuf::Table info;
     tableManager->serializeTable(lock, &table, &info);
@@ -1295,9 +1296,9 @@ TEST_F(TableManagerTest, serializeTable) {
             info.ShortDebugString());
 }
 
-TEST_F(TableManagerTest, sync) {
+TEST_F(TableManagerTest, syncNextTableId) {
     tableManager->nextTableId = 444u;
-    tableManager->sync(lock);
+    tableManager->syncNextTableId(lock);
     EXPECT_EQ("set(UPDATE, tableManager)",
             cluster.externalStorage.log);
     EXPECT_EQ("next_table_id: 444",

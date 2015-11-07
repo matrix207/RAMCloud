@@ -23,10 +23,8 @@
 #ifndef RAMCLOUD_WIREFORMAT_H
 #define RAMCLOUD_WIREFORMAT_H
 
-#include "Common.h"
-#include "LogMetadata.h"
 #include "RejectRules.h"
-#include "Segment.h"
+#include "LogMetadata.h"
 #include "Status.h"
 
 namespace RAMCloud { namespace WireFormat {
@@ -62,6 +60,8 @@ static_assert(INVALID_SERVICE < (sizeof(SerializedServiceMask) * 8),
  * locations:
  * - The method opcodeSymbol in WireFormat.cc.
  * - WireFormatTest.cc's out-of-range test, if ILLEGAL_RPC_TYPE was changed.
+ * - You may need to modify the "callees" table in scripts/genLevels.py,
+ *   which keeps track of which RPCs invoke which other RPCs.
  */
 enum Opcode {
     PING                        = 7,
@@ -89,7 +89,6 @@ enum Opcode {
     BACKUP_STARTREADINGDATA     = 31,
     BACKUP_WRITE                = 32,
     BACKUP_RECOVERYCOMPLETE     = 33,
-    BACKUP_QUIESCE              = 34,
     UPDATE_SERVER_LIST          = 35,
     BACKUP_STARTPARTITION       = 36,
     DROP_TABLET_OWNERSHIP       = 39,
@@ -152,6 +151,7 @@ enum ControlOp {
     STOP_PERF_COUNTERS          = 1009,
     LOG_MESSAGE                 = 1010,
     RESET_METRICS               = 1011,
+    QUIESCE                     = 1012,
 };
 
 /**
@@ -164,7 +164,7 @@ struct ClientLease {
                                 /// become invalid.
     uint64_t timestamp;         /// Cluster time when this lease information was
                                 /// provided by the coordinator.
-};
+} __attribute__((packed));
 
 /**
  * Each RPC request starts with this structure.
@@ -268,28 +268,16 @@ struct BackupGetRecoveryData {
             , certificate()
         {}
         Response(const ResponseCommon& common,
-                 const Segment::Certificate& certificate)
+                 const SegmentCertificate& certificate)
             : common(common)
             , certificate(certificate)
         {}
         ResponseCommon common;
-        Segment::Certificate certificate; ///< Certificate for the segment
-                                          ///< which follows this fields in
-                                          ///< the response field. Used by
-                                          ///< master to iterate over the
-                                          ///< segment.
-    } __attribute__((packed));
-};
-
-// Note: this RPC is supported by the coordinator service as well as backups.
-struct BackupQuiesce {
-    static const Opcode opcode = BACKUP_QUIESCE;
-    static const ServiceType service = BACKUP_SERVICE;
-    struct Request {
-        RequestCommonWithId common;
-    } __attribute__((packed));
-    struct Response {
-        ResponseCommon common;
+        SegmentCertificate certificate; ///< Certificate for the segment
+                                        ///< which follows this fields in
+                                        ///< the response field. Used by
+                                        ///< master to iterate over the
+                                        ///< segment.
     } __attribute__((packed));
 };
 
@@ -417,7 +405,7 @@ struct BackupWrite {
                 bool close,
                 bool primary,
                 bool certificateIncluded,
-                const Segment::Certificate& certificate)
+                const SegmentCertificate& certificate)
             : common(common)
             , masterId(masterId)
             , segmentId(segmentId)
@@ -448,10 +436,10 @@ struct BackupWrite {
                                   ///< true then it includes a valid certificate
                                   ///< that should be placed in the segment
                                   ///< after the data from this write.
-        Segment::Certificate certificate; ///< Certificate which should be
-                                          ///< written to storage
-                                          ///< following the data included
-                                          ///< in this rpc.
+        SegmentCertificate certificate; ///< Certificate which should be
+                                        ///< written to storage
+                                        ///< following the data included
+                                        ///< in this rpc.
         // Opaque byte string follows with data to write.
     } __attribute__((packed));
     struct Response {
@@ -683,11 +671,11 @@ struct GetLeaseInfo {
     static const ServiceType service = COORDINATOR_SERVICE;
     struct Request {
         RequestCommon common;
-        uint64_t leaseId;
+        uint64_t leaseId;       // Id of lease whose info should be returned.
     } __attribute__((packed));
     struct Response {
         ResponseCommon common;
-        ClientLease lease;
+        ClientLease lease;      // Requested lease information.
     } __attribute__((packed));
 };
 
@@ -865,6 +853,9 @@ struct Increment {
     struct Request {
         RequestCommon common;
         uint64_t tableId;
+        ClientLease lease;
+        uint64_t rpcId;
+        uint64_t ackId;
         uint16_t keyLength;           // Length of the key in bytes.
                                       // The actual bytes of the key follow
                                       // immediately after this header.
@@ -1326,10 +1317,10 @@ struct ReceiveMigrationData {
         uint16_t keyLength;     // Length of a key belonging to the indexlet.
         uint32_t segmentBytes;  // Length of the Segment containing migrated
                                 // data following this header.
-        Segment::Certificate certificate; // Certificate for the segment
-                                          // being migrated. Used by
-                                          // master to iterate over the
-                                          // segment.
+        SegmentCertificate certificate; // Certificate for the segment
+                                        // being migrated. Used by
+                                        // master to iterate over the
+                                        // segment.
         // In buffer: The actual bytes for a key belonging to the indexlet
         // (used to determine which indexlet is being migrated);
         // followed by:
@@ -1403,6 +1394,9 @@ struct Remove {
     struct Request {
         RequestCommon common;
         uint64_t tableId;
+        ClientLease lease;
+        uint64_t rpcId;
+        uint64_t ackId;
         uint16_t keyLength;           // Length of the key in bytes.
                                       // The actual key follows
                                       // immediately after this header.
@@ -1708,15 +1702,31 @@ struct TxPrepare {
 
     /// Type of Tx Operation
     /// Note: Make sure INVALID is always last.
-    enum OpType { READ, REMOVE, WRITE, INVALID };
+    /// A client may change opType of ReadOp from READ to READONLY
+    /// to use read-only transaction optimization.
+    enum OpType { READ, READONLY, REMOVE, WRITE, INVALID };
 
-    enum Vote { PREPARED, ABORT };
+    /// Possible participant server responses to the request to prepare the
+    /// included transaction operations for commit.
+    enum Vote { PREPARED,       // OK to commit if all servers agree.
+                ABORT,          // DO NOT commit; should abort commit.
+                COMMITTED };    // Committed directly; no Decision RPCs needed.
+                                // This optimization occurs when the transaction
+                                // only involves a single server (single prepare
+                                // RPC) and the server can unilaterally decide
+                                // to commit.
 
     struct Request {
         RequestCommon common;
         ClientLease lease;          // Lease information for the requested
                                     // transaction.  To ensure prepare requests
                                     // are linearizable.
+        uint64_t clientTxId;        // Client provided transaction identifier
+                                    // which uniquely identifies transaction
+                                    // among transactions from the same client.
+                                    // Paired with the lease identifier, the
+                                    // clientTxId provides a system-wide unique
+                                    // identifier for this transaction.
         uint64_t ackId;             // Id of the largest RPC id whose metadata
                                     // can be garbage-collected.  Used for
                                     // linearizability.
@@ -1740,8 +1750,8 @@ struct TxPrepare {
             // In buffer: The actual key for this part
             // follows immediately after this.
             ReadOp(uint64_t tableId, uint64_t rpcId, uint16_t keyLength,
-                    RejectRules rejectRules)
-                : type(OpType::READ)
+                    RejectRules rejectRules, bool readOnly = false)
+                : type(readOnly ? OpType::READONLY : OpType::READ)
                 , tableId(tableId)
                 , rpcId(rpcId)
                 , keyLength(keyLength)
@@ -1804,8 +1814,6 @@ struct TxRequestAbort {
     static const Opcode opcode = Opcode::TX_REQUEST_ABORT;
     static const ServiceType service = MASTER_SERVICE;
 
-    enum Vote { COMMIT, ABORT, INVALID };
-
     struct Request {
         RequestCommon common;
         uint64_t leaseId; //Recovery coordinator may not know about leaseTerm.
@@ -1819,7 +1827,7 @@ struct TxRequestAbort {
 
     struct Response {
         ResponseCommon common;
-        Vote vote;
+        TxPrepare::Vote vote;
     } __attribute__((packed));
 };
 
@@ -1831,6 +1839,12 @@ struct TxHintFailed {
         RequestCommon common;
         uint64_t leaseId;           // Id of the client lease associated with
                                     // this transaction.
+        uint64_t clientTxId;        // Client provided transaction identifier
+                                    // which uniquely identifies transaction
+                                    // among transactions from the same client.
+                                    // Paired with the lease identifier, the
+                                    // clientTxId provides a system-wide unique
+                                    // identifier for this transaction.
         uint32_t participantCount;  // Number of local objects participating TX
                                     // for this server.
         // List of local Participants

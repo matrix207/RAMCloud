@@ -16,6 +16,7 @@
 #include "TimeTrace.h"
 
 namespace RAMCloud {
+TimeTrace* TimeTrace::globalTimeTrace;
 
 /**
  * Construct a TimeTrace.
@@ -29,6 +30,7 @@ TimeTrace::TimeTrace()
     for (int i = 0; i < BUFFER_SIZE; i++) {
         events[i].message = NULL;
     }
+    globalTimeTrace = this;
 }
 
 /**
@@ -120,6 +122,11 @@ void TimeTrace::reset()
  */
 void TimeTrace::printInternal(string* s)
 {
+    if (readerActive) {
+        RAMCLOUD_LOG(WARNING,
+                "printInternal already active; skipping this call");
+        return;
+    }
     readerActive = true;
 
     // Find the oldest event that we still have (either events[nextIndex],

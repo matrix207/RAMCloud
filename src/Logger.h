@@ -1,4 +1,4 @@
-/* Copyright (c) 2010-2012 Stanford University
+/* Copyright (c) 2010-2015 Stanford University
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -19,7 +19,8 @@
 #include <time.h>
 #include <mutex>
 #include <unordered_map>
-#include "Common.h"
+
+#include "CodeLocation.h"
 #include "SpinLock.h"
 
 
@@ -59,6 +60,7 @@ enum LogLevel {
 enum LogModule {
     DEFAULT_LOG_MODULE = 0,
     TRANSPORT_MODULE,
+    EXTERNAL_STORAGE_MODULE,
     NUM_LOG_MODULES // must be the last element in the enum
 };
 
@@ -72,7 +74,7 @@ enum LogModule {
  */
 class Logger {
   public:
-    explicit Logger(LogLevel level = NOTICE);
+    explicit Logger(LogLevel level = WARNING);
     ~Logger();
     static Logger& get();
 
